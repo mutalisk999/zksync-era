@@ -15,7 +15,8 @@ pub use zksync_system_constants::*;
 use zksync_utils::address_to_h256;
 
 /// Typed fully qualified key of the storage slot in global state tree.
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Serialize, Deserialize)]
 pub struct StorageKey {
     account: AccountTreeId,
     key: H256,
@@ -67,7 +68,7 @@ fn get_address_mapping_key(address: &Address, position: H256) -> H256 {
 pub fn get_nonce_key(account: &Address) -> StorageKey {
     let nonce_manager = AccountTreeId::new(NONCE_HOLDER_ADDRESS);
 
-    // The `minNonce` (used as nonce for EOAs) is stored in a mapping inside the NONCE_HOLDER system contract
+    // The `minNonce` (used as nonce for EOAs) is stored in a mapping inside the `NONCE_HOLDER` system contract
     let key = get_address_mapping_key(account, H256::zero());
 
     StorageKey::new(nonce_manager, key)

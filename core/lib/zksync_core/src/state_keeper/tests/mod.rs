@@ -1,5 +1,3 @@
-use once_cell::sync::Lazy;
-
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -8,42 +6,49 @@ use std::{
     time::Instant,
 };
 
-use multivm::interface::{
-    CurrentExecutionState, ExecutionResult, FinishedL1Batch, L1BatchEnv, L2BlockEnv, Refunds,
-    SystemEnv, TxExecutionMode, VmExecutionResultAndLogs, VmExecutionStatistics,
+use multivm::{
+    interface::{
+        CurrentExecutionState, ExecutionResult, FinishedL1Batch, L1BatchEnv, L2BlockEnv, Refunds,
+        SystemEnv, TxExecutionMode, VmExecutionResultAndLogs, VmExecutionStatistics,
+    },
+    vm_latest::{constants::BLOCK_GAS_LIMIT, VmExecutionLogs},
 };
-use multivm::vm_latest::constants::BLOCK_GAS_LIMIT;
+use once_cell::sync::Lazy;
+use tokio::sync::watch;
 use zksync_config::configs::chain::StateKeeperConfig;
-use zksync_contracts::{BaseSystemContracts, BaseSystemContractsHashes};
+use zksync_contracts::BaseSystemContracts;
 use zksync_system_constants::ZKPORTER_IS_AVAILABLE;
 use zksync_types::{
     aggregated_operations::AggregatedActionType,
-    block::{legacy_miniblock_hash, miniblock_hash, BlockGasCount, MiniblockExecutionData},
-    commitment::{L1BatchMetaParameters, L1BatchMetadata},
-    fee::Fee,
-    l2::L2Tx,
-    transaction_request::PaymasterParams,
-    tx::tx_execution_info::{ExecutionMetrics, VmExecutionLogs},
-    Address, L1BatchNumber, L2ChainId, LogQuery, MiniblockNumber, Nonce, ProtocolVersionId,
-    StorageLogQuery, StorageLogQueryType, Timestamp, Transaction, H256, U256,
+    block::{BlockGasCount, MiniblockExecutionData, MiniblockHasher},
+    fee_model::{BatchFeeInput, PubdataIndependentBatchFeeModelInput},
+    tx::tx_execution_info::ExecutionMetrics,
+    zk_evm_types::{LogQuery, Timestamp},
+    Address, L1BatchNumber, L2ChainId, MiniblockNumber, ProtocolVersionId, StorageLogQuery,
+    StorageLogQueryType, Transaction, H256, U256,
 };
 
 mod tester;
 
-pub(crate) use self::tester::TestBatchExecutorBuilder;
 use self::tester::{
-    bootloader_tip_out_of_gas, pending_batch_data, random_tx, rejected_exec, successful_exec,
-    successful_exec_with_metrics, TestScenario,
+    pending_batch_data, random_tx, random_upgrade_tx, rejected_exec, successful_exec,
+    successful_exec_with_metrics, TestIO, TestScenario,
 };
-use crate::gas_tracker::l1_batch_base_cost;
-use crate::state_keeper::{
-    keeper::POLL_WAIT_DURATION,
-    seal_criteria::{
-        criteria::{GasCriterion, SlotsCriterion},
-        ConditionalSealer,
+pub(crate) use self::tester::{MockBatchExecutor, TestBatchExecutorBuilder};
+use crate::{
+    gas_tracker::l1_batch_base_cost,
+    state_keeper::{
+        batch_executor::TxExecutionResult,
+        keeper::POLL_WAIT_DURATION,
+        seal_criteria::{
+            criteria::{GasCriterion, SlotsCriterion},
+            SequencerSealer,
+        },
+        types::ExecutionMetricsForCriteria,
+        updates::UpdatesManager,
+        ZkSyncStateKeeper,
     },
-    types::ExecutionMetricsForCriteria,
-    updates::UpdatesManager,
+    utils::testonly::create_l2_transaction,
 };
 
 pub(super) static BASE_SYSTEM_CONTRACTS: Lazy<BaseSystemContracts> =
@@ -70,40 +75,19 @@ pub(super) fn default_l1_batch_env(
         previous_batch_hash: None,
         number: L1BatchNumber(number),
         timestamp,
-        l1_gas_price: 1,
-        fair_l2_gas_price: 1,
         fee_account,
         enforced_base_fee: None,
         first_l2_block: L2BlockEnv {
             number,
             timestamp,
-            prev_block_hash: legacy_miniblock_hash(MiniblockNumber(number - 1)),
+            prev_block_hash: MiniblockHasher::legacy_hash(MiniblockNumber(number - 1)),
             max_virtual_blocks_to_create: 1,
         },
-    }
-}
-
-pub(crate) fn create_l1_batch_metadata(number: u32) -> L1BatchMetadata {
-    L1BatchMetadata {
-        root_hash: H256::from_low_u64_be(number.into()),
-        rollup_last_leaf_index: u64::from(number) + 20,
-        merkle_root_hash: H256::from_low_u64_be(number.into()),
-        initial_writes_compressed: vec![],
-        repeated_writes_compressed: vec![],
-        commitment: H256::from_low_u64_be(number.into()),
-        l2_l1_messages_compressed: vec![],
-        l2_l1_merkle_root: H256::from_low_u64_be(number.into()),
-        block_meta_params: L1BatchMetaParameters {
-            zkporter_is_available: ZKPORTER_IS_AVAILABLE,
-            bootloader_code_hash: BASE_SYSTEM_CONTRACTS.bootloader.hash,
-            default_aa_code_hash: BASE_SYSTEM_CONTRACTS.default_aa.hash,
-        },
-        aux_data_hash: H256::zero(),
-        meta_parameters_hash: H256::zero(),
-        pass_through_data_hash: H256::zero(),
-        events_queue_commitment: Some(H256::zero()),
-        bootloader_initial_content_commitment: Some(H256::zero()),
-        state_diffs_compressed: vec![],
+        fee_input: BatchFeeInput::PubdataIndependent(PubdataIndependentBatchFeeModelInput {
+            fair_l2_gas_price: 1,
+            fair_pubdata_price: 1,
+            l1_gas_price: 1,
+        }),
     }
 }
 
@@ -118,52 +102,26 @@ pub(super) fn default_vm_block_result() -> FinishedL1Batch {
         final_execution_state: CurrentExecutionState {
             events: vec![],
             storage_log_queries: vec![],
+            deduplicated_storage_log_queries: vec![],
             used_contract_hashes: vec![],
-            l2_to_l1_logs: vec![],
+            user_l2_to_l1_logs: vec![],
+            system_logs: vec![],
             total_log_queries: 0,
             cycles_used: 0,
+            deduplicated_events_logs: vec![],
             storage_refunds: Vec::new(),
         },
         final_bootloader_memory: Some(vec![]),
+        pubdata_input: Some(vec![]),
     }
 }
 
 pub(super) fn create_updates_manager() -> UpdatesManager {
     let l1_batch_env = default_l1_batch_env(1, 1, Address::default());
-    UpdatesManager::new(
-        l1_batch_env,
-        BaseSystemContractsHashes::default(),
-        ProtocolVersionId::latest(),
-    )
+    UpdatesManager::new(&l1_batch_env, &default_system_env())
 }
 
-pub(crate) fn create_l2_transaction(fee_per_gas: u64, gas_per_pubdata: u32) -> L2Tx {
-    let fee = Fee {
-        gas_limit: 1000_u64.into(),
-        max_fee_per_gas: fee_per_gas.into(),
-        max_priority_fee_per_gas: 0_u64.into(),
-        gas_per_pubdata_limit: gas_per_pubdata.into(),
-    };
-    let mut tx = L2Tx::new_signed(
-        Address::random(),
-        vec![],
-        Nonce(0),
-        fee,
-        U256::zero(),
-        L2ChainId::from(271),
-        &H256::random(),
-        None,
-        PaymasterParams::default(),
-    )
-    .unwrap();
-    // Input means all transaction data (NOT calldata, but all tx fields) that came from the API.
-    // This input will be used for the derivation of the tx hash, so put some random to it to be sure
-    // that the transaction hash is unique.
-    tx.set_input(H256::random().0.to_vec(), H256::random());
-    tx
-}
-
-pub(super) fn create_transaction(fee_per_gas: u64, gas_per_pubdata: u32) -> Transaction {
+pub(super) fn create_transaction(fee_per_gas: u64, gas_per_pubdata: u64) -> Transaction {
     create_l2_transaction(fee_per_gas, gas_per_pubdata).into()
 }
 
@@ -181,7 +139,8 @@ pub(super) fn create_execution_result(
         result: ExecutionResult::Success { output: vec![] },
         logs: VmExecutionLogs {
             events: vec![],
-            l2_to_l1_logs: vec![],
+            system_l2_to_l1_logs: vec![],
+            user_l2_to_l1_logs: vec![],
             storage_logs,
             total_log_queries_count: total_log_queries,
         },
@@ -189,8 +148,11 @@ pub(super) fn create_execution_result(
             contracts_used: 0,
             cycles_used: 0,
             gas_used: 0,
+            gas_remaining: 0,
             computational_gas_used: 0,
             total_log_queries,
+            pubdata_published: 0,
+            circuit_statistic: Default::default(),
         },
         refunds: Refunds::default(),
     }
@@ -242,7 +204,7 @@ async fn sealed_by_number_of_txs() {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
 
     TestScenario::new()
         .seal_miniblock_when(|updates| updates.miniblock.executed_transactions.len() == 1)
@@ -263,10 +225,10 @@ async fn sealed_by_gas() {
         close_block_at_gas_percentage: 0.5,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(GasCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(GasCriterion)]);
 
     let l1_gas_per_tx = BlockGasCount {
-        commit: 1, // Both txs together with block_base_cost would bring it over the block 31_001 commit bound.
+        commit: 1, // Both txs together with `block_base_cost` would bring it over the block `31_001` commit bound.
         prove: 0,
         execute: 0,
     };
@@ -312,7 +274,7 @@ async fn sealed_by_gas_then_by_num_tx() {
         transaction_slots: 3,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(
+    let sealer = SequencerSealer::with_sealers(
         config,
         vec![Box::new(GasCriterion), Box::new(SlotsCriterion)],
     );
@@ -349,7 +311,7 @@ async fn batch_sealed_before_miniblock_does() {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
 
     // Miniblock sealer will not return true before the batch is sealed because the batch only has 2 txs.
     TestScenario::new()
@@ -374,7 +336,7 @@ async fn rejected_tx() {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
 
     let rejected_tx = random_tx(1);
     TestScenario::new()
@@ -396,7 +358,7 @@ async fn bootloader_tip_out_of_gas_flow() {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
 
     let first_tx = random_tx(1);
     let bootloader_out_of_gas_tx = random_tx(2);
@@ -408,7 +370,7 @@ async fn bootloader_tip_out_of_gas_flow() {
         .next_tx(
             "Tx -> Bootloader tip out of gas",
             bootloader_out_of_gas_tx.clone(),
-            bootloader_tip_out_of_gas(),
+            TxExecutionResult::BootloaderOutOfGasForTx,
         )
         .tx_rollback(
             "Last tx rolled back to seal the block",
@@ -434,20 +396,22 @@ async fn pending_batch_is_applied() {
         transaction_slots: 3,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
 
     let pending_batch = pending_batch_data(vec![
         MiniblockExecutionData {
             number: MiniblockNumber(1),
             timestamp: 1,
-            prev_block_hash: miniblock_hash(MiniblockNumber(0), 0, H256::zero(), H256::zero()),
+            prev_block_hash: MiniblockHasher::new(MiniblockNumber(0), 0, H256::zero())
+                .finalize(ProtocolVersionId::latest()),
             virtual_blocks: 1,
             txs: vec![random_tx(1)],
         },
         MiniblockExecutionData {
             number: MiniblockNumber(2),
             timestamp: 2,
-            prev_block_hash: miniblock_hash(MiniblockNumber(1), 1, H256::zero(), H256::zero()),
+            prev_block_hash: MiniblockHasher::new(MiniblockNumber(1), 1, H256::zero())
+                .finalize(ProtocolVersionId::latest()),
             virtual_blocks: 1,
             txs: vec![random_tx(2)],
         },
@@ -476,6 +440,47 @@ async fn pending_batch_is_applied() {
         .await;
 }
 
+/// Load protocol upgrade transactions
+#[tokio::test]
+async fn load_upgrade_tx() {
+    let sealer = SequencerSealer::default();
+    let scenario = TestScenario::new();
+    let batch_executor_base = TestBatchExecutorBuilder::new(&scenario);
+    let (stop_sender, stop_receiver) = watch::channel(false);
+
+    let mut io = TestIO::new(stop_sender, scenario);
+    io.add_upgrade_tx(ProtocolVersionId::latest(), random_upgrade_tx(1));
+    io.add_upgrade_tx(ProtocolVersionId::next(), random_upgrade_tx(2));
+
+    let mut sk = ZkSyncStateKeeper::new(
+        stop_receiver,
+        Box::new(io),
+        Box::new(batch_executor_base),
+        Arc::new(sealer),
+    );
+
+    // Since the version hasn't changed, and we are not using shared bridge, we should not load any
+    // upgrade transactions.
+    assert_eq!(
+        sk.load_protocol_upgrade_tx(&[], ProtocolVersionId::latest(), L1BatchNumber(2))
+            .await
+            .unwrap(),
+        None
+    );
+
+    // If the protocol version has changed, we should load the upgrade transaction.
+    assert_eq!(
+        sk.load_protocol_upgrade_tx(&[], ProtocolVersionId::next(), L1BatchNumber(2))
+            .await
+            .unwrap(),
+        Some(random_upgrade_tx(2))
+    );
+
+    // TODO: add one more test case for the shared bridge after it's integrated.
+    // If we are processing the 1st batch while using the shared bridge,
+    // we should load the upgrade transaction -- that's the `SetChainIdUpgrade`.
+}
+
 /// Unconditionally seal the batch without triggering specific criteria.
 #[tokio::test]
 async fn unconditional_sealing() {
@@ -490,7 +495,7 @@ async fn unconditional_sealing() {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
 
     TestScenario::new()
         .seal_l1_batch_when(move |_| batch_seal_trigger_checker.load(Ordering::Relaxed))
@@ -520,12 +525,13 @@ async fn miniblock_timestamp_after_pending_batch() {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
 
     let pending_batch = pending_batch_data(vec![MiniblockExecutionData {
         number: MiniblockNumber(1),
         timestamp: 1,
-        prev_block_hash: miniblock_hash(MiniblockNumber(0), 0, H256::zero(), H256::zero()),
+        prev_block_hash: MiniblockHasher::new(MiniblockNumber(0), 0, H256::zero())
+            .finalize(ProtocolVersionId::latest()),
         virtual_blocks: 1,
         txs: vec![random_tx(1)],
     }]);
@@ -563,7 +569,7 @@ async fn time_is_monotonic() {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
 
     TestScenario::new()
         .seal_miniblock_when(|updates| updates.miniblock.executed_transactions.len() == 1)
@@ -614,7 +620,7 @@ async fn protocol_upgrade() {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
     };
-    let sealer = ConditionalSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
+    let sealer = SequencerSealer::with_sealers(config, vec![Box::new(SlotsCriterion)]);
 
     TestScenario::new()
         .seal_miniblock_when(|updates| updates.miniblock.executed_transactions.len() == 1)

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-
-use zksync_types::prover_server_api::{
+use prover_dal::ProverDal;
+use zksync_prover_interface::api::{
     ProofGenerationData, ProofGenerationDataRequest, ProofGenerationDataResponse,
 };
 
@@ -13,7 +13,7 @@ impl PeriodicApiStruct {
             .put(data.l1_batch_number, &data.data)
             .await
             .expect("Failed to save proof generation data to GCS");
-        let mut connection = self.pool.access_storage().await.unwrap();
+        let mut connection = self.pool.connection().await.unwrap();
         connection
             .fri_protocol_versions_dal()
             .save_prover_protocol_version(data.fri_protocol_version_id, data.l1_verifier_config)
@@ -24,6 +24,7 @@ impl PeriodicApiStruct {
                 data.l1_batch_number,
                 &blob_url,
                 data.fri_protocol_version_id,
+                data.eip_4844_blobs,
             )
             .await;
     }
@@ -33,6 +34,7 @@ impl PeriodicApiStruct {
 impl PeriodicApi<ProofGenerationDataRequest> for PeriodicApiStruct {
     type JobId = ();
     type Response = ProofGenerationDataResponse;
+
     const SERVICE_NAME: &'static str = "ProofGenDataFetcher";
 
     async fn get_next_request(&self) -> Option<(Self::JobId, ProofGenerationDataRequest)> {
@@ -49,7 +51,10 @@ impl PeriodicApi<ProofGenerationDataRequest> for PeriodicApiStruct {
 
     async fn handle_response(&self, _: (), response: Self::Response) {
         match response {
-            ProofGenerationDataResponse::Success(data) => {
+            ProofGenerationDataResponse::Success(None) => {
+                tracing::info!("There are currently no pending batches to be proven");
+            }
+            ProofGenerationDataResponse::Success(Some(data)) => {
                 tracing::info!("Received proof gen data for: {:?}", data.l1_batch_number);
                 self.save_proof_gen_data(data).await;
             }

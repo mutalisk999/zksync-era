@@ -13,18 +13,25 @@ publish = false # We don't want to publish our binaries.
 [dependencies]
 zksync_core = { path = "../../lib/zksync_core" }
 zksync_dal = { path = "../../lib/dal" }
+zksync_db_connection = { path = "../../lib/db_connection" }
 zksync_config = { path = "../../lib/config" }
 zksync_storage = { path = "../../lib/storage" }
 zksync_utils = { path = "../../lib/utils" }
 zksync_state = { path = "../../lib/state" }
 zksync_basic_types = { path = "../../lib/basic_types" }
 zksync_contracts = { path = "../../lib/contracts" }
-
+zksync_l1_contract_interface = { path = "../../lib/l1_contract_interface" }
+zksync_snapshots_applier = { path = "../../lib/snapshots_applier" }
+zksync_object_store = { path = "../../lib/object_store" }
 prometheus_exporter = { path = "../../lib/prometheus_exporter" }
 zksync_health_check = { path = "../../lib/health_check" }
 zksync_web3_decl = { path = "../../lib/web3_decl" }
 zksync_types = { path = "../../lib/types" }
 vlog = { path = "../../lib/vlog" }
+
+zksync_concurrency = { version = "0.1.0", git = "https://github.com/matter-labs/era-consensus.git", rev = "5329a809cfc06d4939fb5ece26c9ad1e1741c50a" }
+zksync_consensus_roles = { version = "0.1.0", git = "https://github.com/matter-labs/era-consensus.git", rev = "5329a809cfc06d4939fb5ece26c9ad1e1741c50a" }
+vise = { git = "https://github.com/matter-labs/vise.git", version = "0.1.0", rev = "1c9cc500e92cf9ea052b230e114a6f9cce4fb2c1" }
 
 anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -33,4 +40,6 @@ serde = { version = "1.0", features = ["derive"] }
 envy = "0.4"
 url = "2.4"
 clap = { version = "4.2.4", features = ["derive"] }
+serde_json = "1"
+semver = "1"
 tracing = "0.1"

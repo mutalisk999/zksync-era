@@ -1,10 +1,21 @@
+use std::{collections::HashMap, fmt};
+
 use sqlx::types::chrono::Utc;
-
-use std::fmt;
-
-use crate::{models::storage_event::StorageL2ToL1Log, SqlxError, StorageProcessor};
+use zksync_db_connection::{
+    connection::Connection, instrument::InstrumentExt, write_str, writeln_str,
+};
+use zksync_system_constants::L1_MESSENGER_ADDRESS;
 use zksync_types::{
-    l2_to_l1_log::L2ToL1Log, tx::IncludedTxLocation, MiniblockNumber, VmEvent, H256,
+    api,
+    event::L1_MESSENGER_BYTECODE_PUBLICATION_EVENT_SIGNATURE,
+    l2_to_l1_log::{L2ToL1Log, UserL2ToL1Log},
+    tx::IncludedTxLocation,
+    Address, L1BatchNumber, MiniblockNumber, VmEvent, H256,
+};
+
+use crate::{
+    models::storage_event::{StorageL2ToL1Log, StorageWeb3Log},
+    Core, CoreDal, SqlxError,
 };
 
 /// Wrapper around an optional event topic allowing to hex-format it for `COPY` instructions.
@@ -23,7 +34,7 @@ impl fmt::LowerHex for EventTopic<'_> {
 
 #[derive(Debug)]
 pub struct EventsDal<'a, 'c> {
-    pub(crate) storage: &'a mut StorageProcessor<'c>,
+    pub(crate) storage: &'a mut Connection<'c, Core>,
 }
 
 impl EventsDal<'_, '_> {
@@ -91,20 +102,24 @@ impl EventsDal<'_, '_> {
     /// Removes events with a block number strictly greater than the specified `block_number`.
     pub async fn rollback_events(&mut self, block_number: MiniblockNumber) {
         sqlx::query!(
-            "DELETE FROM events WHERE miniblock_number > $1",
-            block_number.0 as i64
+            r#"
+            DELETE FROM events
+            WHERE
+                miniblock_number > $1
+            "#,
+            i64::from(block_number.0)
         )
         .execute(self.storage.conn())
         .await
         .unwrap();
     }
 
-    /// Saves L2-to-L1 logs from a miniblock. Logs must be ordered by transaction location
+    /// Saves user L2-to-L1 logs from a miniblock. Logs must be ordered by transaction location
     /// and within each transaction.
-    pub async fn save_l2_to_l1_logs(
+    pub async fn save_user_l2_to_l1_logs(
         &mut self,
         block_number: MiniblockNumber,
-        all_block_l2_to_l1_logs: &[(IncludedTxLocation, Vec<&L2ToL1Log>)],
+        all_block_l2_to_l1_logs: &[(IncludedTxLocation, Vec<&UserL2ToL1Log>)],
     ) {
         let mut copy = self
             .storage
@@ -139,7 +154,7 @@ impl EventsDal<'_, '_> {
                     sender,
                     key,
                     value,
-                } = log;
+                } = log.0;
 
                 write_str!(
                     &mut buffer,
@@ -164,39 +179,229 @@ impl EventsDal<'_, '_> {
     /// Removes all L2-to-L1 logs with a miniblock number strictly greater than the specified `block_number`.
     pub async fn rollback_l2_to_l1_logs(&mut self, block_number: MiniblockNumber) {
         sqlx::query!(
-            "DELETE FROM l2_to_l1_logs WHERE miniblock_number > $1",
-            block_number.0 as i64
+            r#"
+            DELETE FROM l2_to_l1_logs
+            WHERE
+                miniblock_number > $1
+            "#,
+            i64::from(block_number.0)
         )
         .execute(self.storage.conn())
         .await
         .unwrap();
     }
 
-    pub(crate) async fn l2_to_l1_logs(
+    pub(crate) async fn get_logs_by_tx_hashes(
         &mut self,
-        tx_hash: H256,
-    ) -> Result<Vec<StorageL2ToL1Log>, SqlxError> {
-        sqlx::query_as!(
-            StorageL2ToL1Log,
-            "SELECT \
-                miniblock_number, log_index_in_miniblock, log_index_in_tx, tx_hash, \
-                Null::bytea as \"block_hash\", Null::bigint as \"l1_batch_number?\", \
-                shard_id, is_service, tx_index_in_miniblock, tx_index_in_l1_batch, sender, key, value \
-            FROM l2_to_l1_logs \
-            WHERE tx_hash = $1 \
-            ORDER BY log_index_in_tx ASC",
-            tx_hash.as_bytes()
+        hashes: &[H256],
+    ) -> Result<HashMap<H256, Vec<api::Log>>, SqlxError> {
+        let hashes = hashes
+            .iter()
+            .map(|hash| hash.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let logs: Vec<_> = sqlx::query_as!(
+            StorageWeb3Log,
+            r#"
+            SELECT
+                address,
+                topic1,
+                topic2,
+                topic3,
+                topic4,
+                value,
+                NULL::bytea AS "block_hash",
+                NULL::BIGINT AS "l1_batch_number?",
+                miniblock_number,
+                tx_hash,
+                tx_index_in_block,
+                event_index_in_block,
+                event_index_in_tx
+            FROM
+                events
+            WHERE
+                tx_hash = ANY ($1)
+            ORDER BY
+                miniblock_number ASC,
+                event_index_in_block ASC
+            "#,
+            &hashes[..],
         )
         .fetch_all(self.storage.conn())
-        .await
+        .await?;
+
+        let mut result = HashMap::<H256, Vec<api::Log>>::new();
+
+        for storage_log in logs {
+            let current_log = api::Log::from(storage_log);
+            let tx_hash = current_log.transaction_hash.unwrap();
+            result.entry(tx_hash).or_default().push(current_log);
+        }
+
+        Ok(result)
+    }
+
+    pub(crate) async fn get_l1_batch_raw_published_bytecode_hashes(
+        &mut self,
+        l1_batch_number: L1BatchNumber,
+    ) -> Result<Vec<H256>, SqlxError> {
+        let Some((from_miniblock, to_miniblock)) = self
+            .storage
+            .blocks_dal()
+            .get_miniblock_range_of_l1_batch(l1_batch_number)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let result: Vec<_> = sqlx::query!(
+            r#"
+            SELECT
+                value
+            FROM
+                events
+            WHERE
+                miniblock_number BETWEEN $1 AND $2
+                AND address = $3
+                AND topic1 = $4
+            ORDER BY
+                miniblock_number,
+                event_index_in_block
+            "#,
+            i64::from(from_miniblock.0),
+            i64::from(to_miniblock.0),
+            L1_MESSENGER_ADDRESS.as_bytes(),
+            L1_MESSENGER_BYTECODE_PUBLICATION_EVENT_SIGNATURE.as_bytes()
+        )
+        .fetch_all(self.storage.conn())
+        .await?
+        .into_iter()
+        .map(|row| H256::from_slice(&row.value))
+        .collect();
+
+        Ok(result)
+    }
+
+    pub(crate) async fn get_l2_to_l1_logs_by_hashes(
+        &mut self,
+        hashes: &[H256],
+    ) -> Result<HashMap<H256, Vec<api::L2ToL1Log>>, SqlxError> {
+        let hashes = &hashes
+            .iter()
+            .map(|hash| hash.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let logs: Vec<_> = sqlx::query_as!(
+            StorageL2ToL1Log,
+            r#"
+            SELECT
+                miniblock_number,
+                log_index_in_miniblock,
+                log_index_in_tx,
+                tx_hash,
+                NULL::bytea AS "block_hash",
+                NULL::BIGINT AS "l1_batch_number?",
+                shard_id,
+                is_service,
+                tx_index_in_miniblock,
+                tx_index_in_l1_batch,
+                sender,
+                key,
+                value
+            FROM
+                l2_to_l1_logs
+            WHERE
+                tx_hash = ANY ($1)
+            ORDER BY
+                tx_index_in_l1_batch ASC,
+                log_index_in_tx ASC
+            "#,
+            &hashes[..]
+        )
+        .fetch_all(self.storage.conn())
+        .await?;
+
+        let mut result = HashMap::<H256, Vec<api::L2ToL1Log>>::new();
+
+        for storage_log in logs {
+            let current_log = api::L2ToL1Log::from(storage_log);
+            result
+                .entry(current_log.transaction_hash)
+                .or_default()
+                .push(current_log);
+        }
+
+        Ok(result)
+    }
+
+    pub async fn get_vm_events_for_l1_batch(
+        &mut self,
+        l1_batch_number: L1BatchNumber,
+    ) -> Result<Option<Vec<VmEvent>>, SqlxError> {
+        let Some((from_miniblock, to_miniblock)) = self
+            .storage
+            .blocks_dal()
+            .get_miniblock_range_of_l1_batch(l1_batch_number)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut tx_index_in_l1_batch = -1;
+        let events = sqlx::query!(
+            r#"
+            SELECT
+                address,
+                topic1,
+                topic2,
+                topic3,
+                topic4,
+                value,
+                event_index_in_tx
+            FROM
+                events
+            WHERE
+                miniblock_number BETWEEN $1 AND $2
+            ORDER BY
+                miniblock_number ASC,
+                event_index_in_block ASC
+            "#,
+            i64::from(from_miniblock.0),
+            i64::from(to_miniblock.0),
+        )
+        .instrument("get_vm_events_for_l1_batch")
+        .report_latency()
+        .fetch_all(self.storage)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let indexed_topics = vec![row.topic1, row.topic2, row.topic3, row.topic4]
+                .into_iter()
+                .filter_map(|topic| {
+                    if !topic.is_empty() {
+                        Some(H256::from_slice(&topic))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if row.event_index_in_tx == 0 {
+                tx_index_in_l1_batch += 1;
+            }
+            VmEvent {
+                location: (l1_batch_number, tx_index_in_l1_batch as u32),
+                address: Address::from_slice(&row.address),
+                indexed_topics,
+                value: row.value,
+            }
+        })
+        .collect();
+        Ok(Some(events))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{tests::create_miniblock_header, ConnectionPool};
     use zksync_types::{Address, L1BatchNumber, ProtocolVersion};
+
+    use super::*;
+    use crate::{tests::create_miniblock_header, ConnectionPool, Core};
 
     fn create_vm_event(index: u8, topic_count: u8) -> VmEvent {
         assert!(topic_count <= 4);
@@ -210,8 +415,8 @@ mod tests {
 
     #[tokio::test]
     async fn storing_events() {
-        let pool = ConnectionPool::test_pool().await;
-        let mut conn = pool.access_storage().await.unwrap();
+        let pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = pool.connection().await.unwrap();
         conn.events_dal().rollback_events(MiniblockNumber(0)).await;
         conn.blocks_dal()
             .delete_miniblocks(MiniblockNumber(0))
@@ -273,21 +478,21 @@ mod tests {
         }
     }
 
-    fn create_l2_to_l1_log(tx_number_in_block: u16, index: u8) -> L2ToL1Log {
-        L2ToL1Log {
+    fn create_l2_to_l1_log(tx_number_in_block: u16, index: u8) -> UserL2ToL1Log {
+        UserL2ToL1Log(L2ToL1Log {
             shard_id: 0,
             is_service: false,
             tx_number_in_block,
             sender: Address::repeat_byte(index),
             key: H256::from_low_u64_be(u64::from(index)),
             value: H256::repeat_byte(index),
-        }
+        })
     }
 
     #[tokio::test]
     async fn storing_l2_to_l1_logs() {
-        let pool = ConnectionPool::test_pool().await;
-        let mut conn = pool.access_storage().await.unwrap();
+        let pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = pool.connection().await.unwrap();
         conn.events_dal()
             .rollback_l2_to_l1_logs(MiniblockNumber(0))
             .await;
@@ -324,39 +529,46 @@ mod tests {
             (second_location, second_logs.iter().collect()),
         ];
         conn.events_dal()
-            .save_l2_to_l1_logs(MiniblockNumber(1), &all_logs)
+            .save_user_l2_to_l1_logs(MiniblockNumber(1), &all_logs)
             .await;
 
         let logs = conn
             .events_dal()
-            .l2_to_l1_logs(H256([1; 32]))
+            .get_l2_to_l1_logs_by_hashes(&[H256([1; 32])])
             .await
             .unwrap();
+
+        let logs = logs.get(&H256([1; 32])).unwrap().clone();
+
         assert_eq!(logs.len(), first_logs.len());
         for (i, log) in logs.iter().enumerate() {
-            assert_eq!(log.log_index_in_miniblock as usize, i);
-            assert_eq!(log.log_index_in_tx as usize, i);
+            assert_eq!(log.log_index.as_usize(), i);
+            assert_eq!(log.transaction_log_index.as_usize(), i);
         }
         for (log, expected_log) in logs.iter().zip(&first_logs) {
-            assert_eq!(log.key, expected_log.key.as_bytes());
-            assert_eq!(log.value, expected_log.value.as_bytes());
-            assert_eq!(log.sender, expected_log.sender.as_bytes());
+            assert_eq!(log.key.as_bytes(), expected_log.0.key.as_bytes());
+            assert_eq!(log.value.as_bytes(), expected_log.0.value.as_bytes());
+            assert_eq!(log.sender.as_bytes(), expected_log.0.sender.as_bytes());
         }
 
         let logs = conn
             .events_dal()
-            .l2_to_l1_logs(H256([2; 32]))
+            .get_l2_to_l1_logs_by_hashes(&[H256([2; 32])])
             .await
-            .unwrap();
+            .unwrap()
+            .get(&H256([2; 32]))
+            .unwrap()
+            .clone();
+
         assert_eq!(logs.len(), second_logs.len());
         for (i, log) in logs.iter().enumerate() {
-            assert_eq!(log.log_index_in_miniblock as usize, i + first_logs.len());
-            assert_eq!(log.log_index_in_tx as usize, i);
+            assert_eq!(log.log_index.as_usize(), i + first_logs.len());
+            assert_eq!(log.transaction_log_index.as_usize(), i);
         }
         for (log, expected_log) in logs.iter().zip(&second_logs) {
-            assert_eq!(log.key, expected_log.key.as_bytes());
-            assert_eq!(log.value, expected_log.value.as_bytes());
-            assert_eq!(log.sender, expected_log.sender.as_bytes());
+            assert_eq!(log.key.as_bytes(), expected_log.0.key.as_bytes());
+            assert_eq!(log.value.as_bytes(), expected_log.0.value.as_bytes());
+            assert_eq!(log.sender.as_bytes(), expected_log.0.sender.as_bytes());
         }
     }
 }

@@ -1,13 +1,14 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fmt, mem,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
-use crate::{ReadStorage, WriteStorage};
 use zksync_types::{witness_block_state::WitnessBlockState, StorageKey, StorageValue, H256};
+
+use crate::{ReadStorage, WriteStorage};
 
 /// Metrics for [`StorageView`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -58,6 +59,11 @@ impl<S> StorageView<S> {
             read_storage_key: self.read_storage_keys.clone(),
             is_write_initial: self.initial_writes_cache.clone(),
         }
+    }
+
+    /// Returns the modified storage keys
+    pub fn modified_storage_keys(&self) -> &HashMap<StorageKey, StorageValue> {
+        &self.modified_storage_keys
     }
 }
 
@@ -174,6 +180,10 @@ impl<S: ReadStorage + fmt::Debug> ReadStorage for StorageView<S> {
 }
 
 impl<S: ReadStorage + fmt::Debug> WriteStorage for StorageView<S> {
+    fn read_storage_keys(&self) -> &HashMap<StorageKey, StorageValue> {
+        &self.read_storage_keys
+    }
+
     fn set_value(&mut self, key: StorageKey, value: StorageValue) -> StorageValue {
         let started_at = Instant::now();
         self.metrics.set_value_storage_invocations += 1;
@@ -204,9 +214,10 @@ impl<S: ReadStorage + fmt::Debug> WriteStorage for StorageView<S> {
 
 #[cfg(test)]
 mod test {
+    use zksync_types::{AccountTreeId, Address, H256};
+
     use super::*;
     use crate::InMemoryStorage;
-    use zksync_types::{AccountTreeId, Address, H256};
 
     #[test]
     fn test_storage_access() {

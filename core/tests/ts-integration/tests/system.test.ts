@@ -30,6 +30,26 @@ describe('System behavior checks', () => {
         alice = testMaster.mainAccount();
     });
 
+    test('Network should be supporting Cancun+Deneb', async () => {
+        const address_a = '0x000000000000000000000000000000000000000A';
+        const address_b = '0x000000000000000000000000000000000000000b';
+
+        const transaction_a = {
+            to: address_a,
+            data: '0x'
+        };
+
+        await expect(alice.providerL1!.call(transaction_a)).rejects.toThrow();
+
+        const transaction_b = {
+            to: address_b,
+            data: '0x'
+        };
+
+        const result_b = await alice.providerL1!.call(transaction_b);
+        expect(result_b).toEqual('0x');
+    });
+
     test('Should check that system contracts and SDK create same CREATE/CREATE2 addresses', async () => {
         const deployerContract = new zksync.Contract(
             zksync.utils.CONTRACT_DEPLOYER_ADDRESS,
@@ -181,8 +201,8 @@ describe('System behavior checks', () => {
     });
 
     test('Should execute withdrawals with different parameters in one block', async () => {
-        // This test checks the SDK/system contracts (not even the server) behavior, and it's very time consuming,
-        // so it doesn't make sense to run it outside of the localhost environment.
+        // This test checks the SDK/system contracts (not even the server) behavior, and it's very time-consuming,
+        // so it doesn't make sense to run it outside the localhost environment.
         if (testMaster.isFastMode()) {
             return;
         }
@@ -192,11 +212,13 @@ describe('System behavior checks', () => {
         const l1Token = testMaster.environment().erc20Token.l1Address;
         const amount = 1;
 
-        // Fund bob's account.
+        // Fund Bob's account.
         await alice.transfer({ amount, to: bob.address, token: l2Token }).then((tx) => tx.wait());
+        testMaster.reporter.debug('Sent L2 token to Bob');
         await alice
             .transfer({ amount: L2_ETH_PER_ACCOUNT.div(8), to: bob.address, token: zksync.utils.ETH_ADDRESS })
             .then((tx) => tx.wait());
+        testMaster.reporter.debug('Sent ethereum on L2 to Bob');
 
         // Prepare matcher modifiers for L1 balance change.
         const aliceChange = await shouldChangeTokenBalances(l1Token, [{ wallet: alice, change: amount }], { l1: true });
@@ -213,13 +235,21 @@ describe('System behavior checks', () => {
             .then((response) => response.waitFinalize());
 
         const [aliceReceipt, bobReceipt] = await Promise.all([aliceWithdrawalPromise, bobWithdrawalPromise]);
+        testMaster.reporter.debug(
+            `Obtained withdrawal receipt for Alice: blockNumber=${aliceReceipt.blockNumber}, l1BatchNumber=${aliceReceipt.l1BatchNumber}, status=${aliceReceipt.status}`
+        );
+        testMaster.reporter.debug(
+            `Obtained withdrawal receipt for Bob: blockNumber=${bobReceipt.blockNumber}, l1BatchNumber=${bobReceipt.l1BatchNumber}, status=${bobReceipt.status}`
+        );
         await expect(alice.finalizeWithdrawal(aliceReceipt.transactionHash)).toBeAccepted([aliceChange]);
+        testMaster.reporter.debug('Finalized withdrawal for Alice');
         await expect(alice.finalizeWithdrawal(bobReceipt.transactionHash)).toBeAccepted([bobChange]);
+        testMaster.reporter.debug('Finalized withdrawal for Bob');
     });
 
-    test('Should execute a the withdrawal with same parameters twice', async () => {
+    test('Should execute a withdrawal with same parameters twice', async () => {
         // This test is a logical copy of the previous one, but in this one we send two withdrawals from the same account
-        // It's skipped on the localhost for the same reason.
+        // It's skipped outside the localhost environment for the same reason.
         if (testMaster.isFastMode()) {
             return;
         }
@@ -232,11 +262,13 @@ describe('System behavior checks', () => {
         // the first finalization the diff would be (compared to now) `amount`, and after the second -- `amount*2`.
         const change1 = await shouldChangeTokenBalances(l1Token, [{ wallet: alice, change: amount }], { l1: true });
         const change2 = await shouldChangeTokenBalances(l1Token, [{ wallet: alice, change: amount * 2 }], { l1: true });
+        testMaster.reporter.debug('Prepared token balance modifiers');
 
         // Maximize chances of including transactions into the same block by first creating both promises
-        // and only then awaiting them. This is still probabalistic though: if this test becomes flaky,
+        // and only then awaiting them. This is still probabilistic though: if this test becomes flaky,
         // most likely there exists a very big problem in the system.
         const nonce = await alice.getTransactionCount();
+        testMaster.reporter.debug(`Obtained Alice's nonce: ${nonce}`);
         const withdrawal1 = alice
             .withdraw({ token: l2Token, amount, overrides: { nonce } })
             .then((response) => response.waitFinalize());
@@ -245,8 +277,16 @@ describe('System behavior checks', () => {
             .then((response) => response.waitFinalize());
 
         const [receipt1, receipt2] = await Promise.all([withdrawal1, withdrawal2]);
+        testMaster.reporter.debug(
+            `Obtained withdrawal receipt #1: blockNumber=${receipt1.blockNumber}, l1BatchNumber=${receipt1.l1BatchNumber}, status=${receipt1.status}`
+        );
+        testMaster.reporter.debug(
+            `Obtained withdrawal receipt #2: blockNumber=${receipt2.blockNumber}, l1BatchNumber=${receipt2.l1BatchNumber}, status=${receipt2.status}`
+        );
         await expect(alice.finalizeWithdrawal(receipt1.transactionHash)).toBeAccepted([change1]);
+        testMaster.reporter.debug('Finalized withdrawal #1');
         await expect(alice.finalizeWithdrawal(receipt2.transactionHash)).toBeAccepted([change2]);
+        testMaster.reporter.debug('Finalized withdrawal #2');
     });
 
     // TODO (SMA-1713): the test is flaky.
@@ -341,7 +381,7 @@ describe('System behavior checks', () => {
     function bootloaderUtilsContract() {
         const BOOTLOADER_UTILS_ADDRESS = '0x000000000000000000000000000000000000800c';
         const BOOTLOADER_UTILS = new ethers.utils.Interface(
-            require(`${process.env.ZKSYNC_HOME}/etc/system-contracts/artifacts-zk/cache-zk/solpp-generated-contracts/BootloaderUtilities.sol/BootloaderUtilities.json`).abi
+            require(`${process.env.ZKSYNC_HOME}/contracts/system-contracts/artifacts-zk/contracts-preprocessed/BootloaderUtilities.sol/BootloaderUtilities.json`).abi
         );
 
         return new ethers.Contract(BOOTLOADER_UTILS_ADDRESS, BOOTLOADER_UTILS, alice);
@@ -380,7 +420,7 @@ export interface TransactionData {
     // is to be passed to account and any changes to its structure
     // would mean a breaking change to these accounts. In order to prevent this,
     // we should keep some fields as "reserved".
-    // It is also recommneded that their length is fixed, since
+    // It is also recommended that their length is fixed, since
     // it would allow easier proof integration (in case we will need
     // some special circuit for preprocessing transactions).
     reserved: BigNumberish[];

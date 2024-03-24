@@ -1,4 +1,4 @@
-# What ❔
+## What ❔
 
 <!-- What are the changes this PR brings about? -->
 <!-- Example: This PR adds a PR template to the repo. -->
@@ -18,3 +18,5 @@
 - [ ] Tests for the changes have been added / updated.
 - [ ] Documentation comments have been added / updated.
 - [ ] Code has been formatted via `zk fmt` and `zk lint`.
+- [ ] Spellcheck has been run via `zk spellcheck`.
+- [ ] Linkcheck has been run via `zk linkcheck`.

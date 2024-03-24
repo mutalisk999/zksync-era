@@ -1,20 +1,17 @@
-// External uses
-use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-
-// Workspace uses
-use crate::types::{
-    Block, Bytes, FeeHistory, Filter, FilterChanges, Index, Log, SyncState, TransactionReceipt,
-    U256, U64,
+use jsonrpsee::{
+    core::{RpcResult, SubscriptionResult},
+    proc_macros::rpc,
 };
-
 use zksync_types::{
-    api::Transaction,
-    api::{BlockIdVariant, BlockNumber, TransactionVariant},
+    api::{BlockId, BlockIdVariant, BlockNumber, Transaction, TransactionVariant},
     transaction_request::CallRequest,
     Address, H256,
 };
 
-// Local uses
+use crate::types::{
+    Block, Bytes, FeeHistory, Filter, FilterChanges, Index, Log, PubSubFilter, SyncState,
+    TransactionReceipt, U256, U64,
+};
 
 #[cfg_attr(
     all(feature = "client", feature = "server"),
@@ -88,6 +85,12 @@ pub trait EthNamespace {
         &self,
         block_number: BlockNumber,
     ) -> RpcResult<Option<U256>>;
+
+    #[method(name = "getBlockReceipts")]
+    async fn get_block_receipts(
+        &self,
+        block_id: BlockId,
+    ) -> RpcResult<Option<Vec<TransactionReceipt>>>;
 
     #[method(name = "getBlockTransactionCountByHash")]
     async fn get_block_transaction_count_by_hash(
@@ -171,4 +174,11 @@ pub trait EthNamespace {
         newest_block: BlockNumber,
         reward_percentiles: Vec<f32>,
     ) -> RpcResult<FeeHistory>;
+}
+
+#[rpc(server, namespace = "eth")]
+pub trait EthPubSub {
+    #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = PubSubResult)]
+    async fn subscribe(&self, sub_type: String, filter: Option<PubSubFilter>)
+        -> SubscriptionResult;
 }

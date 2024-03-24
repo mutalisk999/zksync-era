@@ -7,12 +7,9 @@ import { Token } from '../src/types';
 import { spawn as _spawn } from 'child_process';
 
 import * as zksync from 'zksync-web3';
+import * as ethers from 'ethers';
 import { scaledGasPrice } from '../src/helpers';
-import {
-    L1ERC20BridgeFactory,
-    TransparentUpgradeableProxyFactory,
-    AllowListFactory
-} from 'l1-zksync-contracts/typechain';
+import { L1ERC20BridgeFactory, TransparentUpgradeableProxyFactory } from 'l1-contracts/typechain';
 import { sleep } from 'zk/build/utils';
 
 describe('Tests for the custom bridge behavior', () => {
@@ -39,33 +36,44 @@ describe('Tests for the custom bridge behavior', () => {
         });
         await transferTx.wait();
 
-        let allowList = new AllowListFactory(alice._signerL1());
-        let allowListContract = await allowList.deploy(alice.address);
-        await allowListContract.deployTransaction.wait(2);
-
         // load the l1bridge contract
         let l1bridgeFactory = new L1ERC20BridgeFactory(alice._signerL1());
         const gasPrice = await scaledGasPrice(alice);
 
-        let l1Bridge = await l1bridgeFactory.deploy(
-            process.env.CONTRACTS_DIAMOND_PROXY_ADDR!,
-            allowListContract.address
-        );
-        await l1Bridge.deployTransaction.wait(2);
+        let l1Bridge = await l1bridgeFactory.deploy(process.env.CONTRACTS_DIAMOND_PROXY_ADDR!);
+        await l1Bridge.deployTransaction.wait();
         let l1BridgeProxyFactory = new TransparentUpgradeableProxyFactory(alice._signerL1());
         let l1BridgeProxy = await l1BridgeProxyFactory.deploy(l1Bridge.address, bob.address, '0x');
         const amount = 1000; // 1000 wei is enough.
-        await l1BridgeProxy.deployTransaction.wait(2);
+        await l1BridgeProxy.deployTransaction.wait();
 
         const isLocalSetup = process.env.ZKSYNC_LOCAL_SETUP;
-        const baseCommandL1 = isLocalSetup ? `yarn --cwd /contracts/ethereum` : `cd $ZKSYNC_HOME && yarn l1-contracts`;
+        const baseCommandL1 = isLocalSetup
+            ? `yarn --cwd /contracts/l1-contracts`
+            : `cd $ZKSYNC_HOME && yarn l1-contracts`;
         let args = `--private-key ${alice.privateKey} --erc20-bridge ${l1BridgeProxy.address}`;
         let command = `${baseCommandL1} initialize-bridges ${args}`;
         await spawn(command);
-        await sleep(2);
 
-        await allowListContract.setAccessMode(l1BridgeProxy.address, 2);
         let l1bridge2 = new L1ERC20BridgeFactory(alice._signerL1()).attach(l1BridgeProxy.address);
+
+        const maxAttempts = 5;
+        let ready = false;
+        for (let i = 0; i < maxAttempts; ++i) {
+            const l2Bridge = await l1bridge2.l2Bridge();
+            if (l2Bridge != ethers.constants.AddressZero) {
+                const code = await alice._providerL2().getCode(l2Bridge);
+                if (code.length > 2) {
+                    ready = true;
+                    break;
+                }
+            }
+            await sleep(1);
+        }
+        if (!ready) {
+            throw new Error('Failed to wait for the l2 bridge init');
+        }
+
         let l2TokenAddress = await l1bridge2.callStatic.l2TokenAddress(tokenDetails.l1Address);
         const initialBalanceL1 = await alice.getBalanceL1(tokenDetails.l1Address);
         const initialBalanceL2 = await alice.getBalance(l2TokenAddress);

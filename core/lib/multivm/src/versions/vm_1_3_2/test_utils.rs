@@ -10,16 +10,17 @@ use std::collections::HashMap;
 
 use itertools::Itertools;
 use zk_evm_1_3_3::{aux_structures::Timestamp, vm_state::VmLocalState};
-use zksync_contracts::test_contracts::LoadnextContractExecutionParams;
-use zksync_contracts::{deployer_contract, get_loadnext_contract, load_contract};
+use zksync_contracts::{
+    deployer_contract, get_loadnext_contract, load_contract,
+    test_contracts::LoadnextContractExecutionParams,
+};
 use zksync_state::WriteStorage;
 use zksync_types::{
     ethabi::{Address, Token},
     fee::Fee,
     l2::L2Tx,
     web3::signing::keccak256,
-    Execute, L2ChainId, Nonce, StorageKey, StorageLogQuery, StorageValue,
-    CONTRACT_DEPLOYER_ADDRESS, H256, U256,
+    Execute, L2ChainId, Nonce, StorageKey, StorageValue, CONTRACT_DEPLOYER_ADDRESS, H256, U256,
 };
 use zksync_utils::{
     address_to_h256, bytecode::hash_bytecode, h256_to_account_address, u256_to_h256,
@@ -32,7 +33,8 @@ use crate::vm_1_3_2::{
         AppDataFrameManagerWithHistory, HistoryEnabled, HistoryMode, HistoryRecorder,
     },
     memory::SimpleMemory,
-    vm::ZkSyncVmState,
+    utils::StorageLogQuery,
+    vm_instance::ZkSyncVmState,
     VmInstance,
 };
 
@@ -59,7 +61,7 @@ impl PartialEq for ModifiedKeysMap {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct DecommitterTestInnerState<H: HistoryMode> {
-    /// There is no way to "trully" compare the storage pointer,
+    /// There is no way to "truly" compare the storage pointer,
     /// so we just compare the modified keys. This is reasonable enough.
     pub modified_storage_keys: ModifiedKeysMap,
     pub known_bytecodes: HistoryRecorder<HashMap<U256, Vec<U256>>, H>,
@@ -67,8 +69,8 @@ pub struct DecommitterTestInnerState<H: HistoryMode> {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub struct StorageOracleInnerState<H: HistoryMode> {
-    /// There is no way to "trully" compare the storage pointer,
+pub(crate) struct StorageOracleInnerState<H: HistoryMode> {
+    /// There is no way to "truly" compare the storage pointer,
     /// so we just compare the modified keys. This is reasonable enough.
     pub modified_storage_keys: ModifiedKeysMap,
 

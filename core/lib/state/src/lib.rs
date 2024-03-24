@@ -19,6 +19,7 @@ use zksync_types::{
 
 mod cache;
 mod in_memory;
+mod mempool_cache;
 mod postgres;
 mod rocksdb;
 mod shadow_storage;
@@ -29,8 +30,9 @@ mod witness;
 
 pub use self::{
     in_memory::{InMemoryStorage, IN_MEMORY_STORAGE_DEFAULT_NETWORK_ID},
-    postgres::{PostgresStorage, PostgresStorageCaches},
-    rocksdb::RocksdbStorage,
+    mempool_cache::MempoolCache,
+    postgres::{PostgresStorage, PostgresStorageCaches, PostgresStorageCachesTask},
+    rocksdb::{RocksbStorageBuilder, RocksdbStorage},
     shadow_storage::ShadowStorage,
     storage_view::{StorageView, StorageViewMetrics},
     witness::WitnessStorage,
@@ -43,7 +45,7 @@ pub trait ReadStorage: fmt::Debug {
 
     /// Checks whether a write to this storage at the specified `key` would be an initial write.
     /// Roughly speaking, this is the case when the storage doesn't contain `key`, although
-    /// in case of mutable storages, the caveats apply (a write to a key that is present
+    /// in case of mutable storage, the caveats apply (a write to a key that is present
     /// in the storage but was not committed is still an initial write).
     fn is_write_initial(&mut self, key: &StorageKey) -> bool;
 
@@ -64,6 +66,9 @@ pub trait ReadStorage: fmt::Debug {
 ///
 /// So far, this trait is implemented only for [`StorageView`].
 pub trait WriteStorage: ReadStorage {
+    /// Returns the map with the key–value pairs read by this batch.
+    fn read_storage_keys(&self) -> &HashMap<StorageKey, StorageValue>;
+
     /// Sets the new value under a given key and returns the previous value.
     fn set_value(&mut self, key: StorageKey, value: StorageValue) -> StorageValue;
 

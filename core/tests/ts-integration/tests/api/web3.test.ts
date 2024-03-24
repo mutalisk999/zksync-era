@@ -39,11 +39,22 @@ describe('web3 API compatibility tests', () => {
         const blockWithTxsByNumber = await alice.provider.getBlockWithTransactions(blockNumber);
         expect(blockWithTxsByNumber.gasLimit).bnToBeGt(0);
         let sumTxGasUsed = ethers.BigNumber.from(0);
+
         for (const tx of blockWithTxsByNumber.transactions) {
             const receipt = await alice.provider.getTransactionReceipt(tx.hash);
             sumTxGasUsed = sumTxGasUsed.add(receipt.gasUsed);
         }
         expect(blockWithTxsByNumber.gasUsed).bnToBeGte(sumTxGasUsed);
+
+        let expectedReceipts = [];
+
+        for (const tx of blockWithTxsByNumber.transactions) {
+            const receipt = await alice.provider.send('eth_getTransactionReceipt', [tx.hash]);
+            expectedReceipts.push(receipt);
+        }
+
+        let receipts = await alice.provider.send('eth_getBlockReceipts', [blockNumberHex]);
+        expect(receipts).toEqual(expectedReceipts);
 
         // eth_getBlockByHash
         await alice.provider.getBlock(blockHash);
@@ -204,9 +215,6 @@ describe('web3 API compatibility tests', () => {
     test('Should test various token methods', async () => {
         const tokens = await alice.provider.getConfirmedTokens();
         expect(tokens).not.toHaveLength(0); // Should not be an empty array.
-
-        const price = await alice.provider.getTokenPrice(l2Token);
-        expect(+price!).toEqual(expect.any(Number));
     });
 
     test('Should check transactions from API / Legacy tx', async () => {
@@ -232,6 +240,42 @@ describe('web3 API compatibility tests', () => {
         const eip1559ApiReceipt = await alice.provider.getTransaction(eip1559Tx.hash);
         expect(eip1559ApiReceipt.maxFeePerGas).bnToBeEq(eip1559Tx.maxFeePerGas!);
         expect(eip1559ApiReceipt.maxPriorityFeePerGas).bnToBeEq(eip1559Tx.maxPriorityFeePerGas!);
+    });
+
+    test('Should test getFilterChanges for pending transactions', async () => {
+        if (process.env.EN_MAIN_NODE_URL) {
+            // Pending transactions logic doesn't work on EN since we don't have proper mempool -
+            // transactions only appear in the DB after they are included in the block.
+            return;
+        }
+
+        // We will need to wait until the mempool cache on the server is updated.
+        // The default update period is 50 ms, so we will wait for 75 ms to be sure.
+        const mempoolCacheWait = 50 + 25;
+
+        let filterId = await alice.provider.send('eth_newPendingTransactionFilter', []);
+        let changes = await alice.provider.send('eth_getFilterChanges', [filterId]);
+        const tx1 = await alice.sendTransaction({
+            to: alice.address
+        });
+        await zksync.utils.sleep(mempoolCacheWait);
+        changes = await alice.provider.send('eth_getFilterChanges', [filterId]);
+        expect(changes).toContain(tx1.hash);
+        const tx2 = await alice.sendTransaction({
+            to: alice.address
+        });
+        const tx3 = await alice.sendTransaction({
+            to: alice.address
+        });
+        const tx4 = await alice.sendTransaction({
+            to: alice.address
+        });
+        await zksync.utils.sleep(mempoolCacheWait);
+        changes = await alice.provider.send('eth_getFilterChanges', [filterId]);
+        expect(changes).not.toContain(tx1.hash);
+        expect(changes).toContain(tx2.hash);
+        expect(changes).toContain(tx3.hash);
+        expect(changes).toContain(tx4.hash);
     });
 
     test('Should test pub-sub API: blocks', async () => {
@@ -279,9 +323,9 @@ describe('web3 API compatibility tests', () => {
         let newTxHash: string | null = null;
         // We can't use `once` as there may be other pending txs sent together with our one.
         wsProvider.on('pending', async (txHash) => {
-            const receipt = await alice.provider.getTransactionReceipt(txHash);
+            const tx = await alice.provider.getTransaction(txHash);
             // We're waiting for the exact transaction to appear.
-            if (!receipt || receipt.to != uniqueRecipient) {
+            if (!tx || tx.to != uniqueRecipient) {
                 // Not the transaction we're looking for.
                 return;
             }
@@ -721,12 +765,24 @@ describe('web3 API compatibility tests', () => {
         let latestBlock = await alice.provider.getBlock('latest');
 
         // Check API returns identical logs by block number and block hash.
-        const getLogsByNumber = await alice.provider.getLogs({
-            fromBlock: latestBlock.number,
-            toBlock: latestBlock.number
+        // Logs can have different `l1BatchNumber` field though,
+        // if L1 batch was sealed in between API requests are processed.
+        const getLogsByNumber = (
+            await alice.provider.getLogs({
+                fromBlock: latestBlock.number,
+                toBlock: latestBlock.number
+            })
+        ).map((x) => {
+            x.l1BatchNumber = 0; // Set bogus value.
+            return x;
         });
-        const getLogsByHash = await alice.provider.getLogs({
-            blockHash: latestBlock.hash
+        const getLogsByHash = (
+            await alice.provider.getLogs({
+                blockHash: latestBlock.hash
+            })
+        ).map((x) => {
+            x.l1BatchNumber = 0; // Set bogus value.
+            return x;
         });
         await expect(getLogsByNumber).toEqual(getLogsByHash);
 
@@ -784,34 +840,10 @@ describe('web3 API compatibility tests', () => {
         expect(exactProtocolVersion).toMatchObject(expectedProtocolVersion);
     });
 
-    test('Should check zks_getLogsWithVirtualBlocks endpoint', async () => {
-        let logs;
-        logs = await alice.provider.send('zks_getLogsWithVirtualBlocks', [{ fromBlock: '0x0', toBlock: '0x0' }]);
-        expect(logs).toEqual([]);
-
-        logs = await alice.provider.send('zks_getLogsWithVirtualBlocks', [{ fromBlock: '0x1', toBlock: '0x2' }]);
-        expect(logs.length > 0).toEqual(true);
-
-        logs = await alice.provider.send('zks_getLogsWithVirtualBlocks', [{ fromBlock: '0x2', toBlock: '0x1' }]);
-        expect(logs).toEqual([]);
-
-        logs = await alice.provider.send('zks_getLogsWithVirtualBlocks', [{ fromBlock: '0x3', toBlock: '0x3' }]);
-        expect(logs.length > 0).toEqual(true);
-
-        await expect(
-            alice.provider.send('zks_getLogsWithVirtualBlocks', [{ fromBlock: '0x100000000', toBlock: '0x100000000' }]) // 2^32
-        ).toBeRejected();
-        await expect(
-            alice.provider.send('zks_getLogsWithVirtualBlocks', [
-                { fromBlock: '0x10000000000000000', toBlock: '0x10000000000000000' } // 2^64
-            ])
-        ).toBeRejected();
-    });
-
     test('Should check transaction signature', async () => {
         const CHAIN_ID = +process.env.CHAIN_ETH_ZKSYNC_NETWORK_ID!;
         const value = 1;
-        const gasLimit = 300000;
+        const gasLimit = 350000;
         const gasPrice = await alice.provider.getGasPrice();
         const data = '0x';
         const to = alice.address;

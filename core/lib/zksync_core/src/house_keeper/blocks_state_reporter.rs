@@ -1,19 +1,20 @@
 use async_trait::async_trait;
-
-use zksync_dal::ConnectionPool;
-use zksync_prover_utils::periodic_job::PeriodicJob;
+use zksync_dal::{ConnectionPool, Core, CoreDal};
 use zksync_utils::time::seconds_since_epoch;
 
-use crate::metrics::{BlockL1Stage, BlockStage, L1StageLatencyLabel, APP_METRICS};
+use crate::{
+    house_keeper::periodic_job::PeriodicJob,
+    metrics::{BlockL1Stage, BlockStage, L1StageLatencyLabel, APP_METRICS},
+};
 
 #[derive(Debug)]
 pub struct L1BatchMetricsReporter {
     reporting_interval_ms: u64,
-    connection_pool: ConnectionPool,
+    connection_pool: ConnectionPool<Core>,
 }
 
 impl L1BatchMetricsReporter {
-    pub fn new(reporting_interval_ms: u64, connection_pool: ConnectionPool) -> Self {
+    pub fn new(reporting_interval_ms: u64, connection_pool: ConnectionPool<Core>) -> Self {
         Self {
             reporting_interval_ms,
             connection_pool,
@@ -21,32 +22,27 @@ impl L1BatchMetricsReporter {
     }
 
     async fn report_metrics(&self) {
-        let mut conn = self.connection_pool.access_storage().await.unwrap();
-        let mut block_metrics = vec![
-            (
-                conn.blocks_dal()
-                    .get_sealed_l1_batch_number()
-                    .await
-                    .unwrap(),
-                BlockStage::Sealed,
-            ),
-            (
-                conn.blocks_dal()
-                    .get_last_l1_batch_number_with_metadata()
-                    .await
-                    .unwrap(),
-                BlockStage::MetadataCalculated,
-            ),
-            (
-                conn.blocks_dal()
-                    .get_last_l1_batch_number_with_witness_inputs()
-                    .await
-                    .unwrap(),
-                BlockStage::MerkleProofCalculated,
-            ),
-        ];
+        let mut block_metrics = vec![];
+        let mut conn = self.connection_pool.connection().await.unwrap();
+        let last_l1_batch = conn
+            .blocks_dal()
+            .get_sealed_l1_batch_number()
+            .await
+            .unwrap();
+        if let Some(number) = last_l1_batch {
+            block_metrics.push((number, BlockStage::Sealed));
+        }
 
-        let eth_stats = conn.eth_sender_dal().get_eth_l1_batches().await;
+        let last_l1_batch_with_metadata = conn
+            .blocks_dal()
+            .get_last_l1_batch_number_with_metadata()
+            .await
+            .unwrap();
+        if let Some(number) = last_l1_batch_with_metadata {
+            block_metrics.push((number, BlockStage::MetadataCalculated));
+        }
+
+        let eth_stats = conn.eth_sender_dal().get_eth_l1_batches().await.unwrap();
         for (tx_type, l1_batch) in eth_stats.saved {
             let stage = BlockStage::L1 {
                 l1_stage: BlockL1Stage::Saved,

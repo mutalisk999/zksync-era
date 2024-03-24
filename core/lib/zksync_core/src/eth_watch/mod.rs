@@ -4,25 +4,17 @@
 //! Poll interval is configured using the `ETH_POLL_INTERVAL` constant.
 //! Number of confirmations is configured using the `CONFIRMATIONS_FOR_ETH_EVENT` environment variable.
 
-use anyhow::Context as _;
+use std::{sync::Arc, time::Duration};
+
 use tokio::{sync::watch, task::JoinHandle};
-
-use std::time::Duration;
-
 use zksync_config::ETHWatchConfig;
-use zksync_dal::{ConnectionPool, StorageProcessor};
+use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_eth_client::EthInterface;
 use zksync_system_constants::PRIORITY_EXPIRATION;
 use zksync_types::{
     ethabi::Contract, web3::types::BlockNumber as Web3BlockNumber, Address, PriorityOpId,
     ProtocolVersionId,
 };
-
-mod client;
-mod event_processors;
-mod metrics;
-#[cfg(test)]
-mod tests;
 
 use self::{
     client::{Error, EthClient, EthHttpQueryClient, RETRY_LIMIT},
@@ -33,6 +25,12 @@ use self::{
     metrics::{PollStage, METRICS},
 };
 
+pub mod client;
+mod event_processors;
+mod metrics;
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug)]
 struct EthWatchState {
     last_seen_version_id: ProtocolVersionId,
@@ -41,32 +39,35 @@ struct EthWatchState {
 }
 
 #[derive(Debug)]
-pub struct EthWatch<W: EthClient + Sync> {
-    client: W,
+pub struct EthWatch {
+    client: Box<dyn EthClient>,
     poll_interval: Duration,
-    event_processors: Vec<Box<dyn EventProcessor<W>>>,
+    event_processors: Vec<Box<dyn EventProcessor>>,
 
     last_processed_ethereum_block: u64,
+    pool: ConnectionPool<Core>,
 }
 
-impl<W: EthClient + Sync> EthWatch<W> {
+impl EthWatch {
     pub async fn new(
         diamond_proxy_address: Address,
         governance_contract: Option<Contract>,
-        mut client: W,
-        pool: &ConnectionPool,
+        mut client: Box<dyn EthClient>,
+        pool: ConnectionPool<Core>,
         poll_interval: Duration,
     ) -> Self {
-        let mut storage = pool.access_storage_tagged("eth_watch").await.unwrap();
+        let mut storage = pool.connection_tagged("eth_watch").await.unwrap();
 
-        let state = Self::initialize_state(&client, &mut storage).await;
+        let state = Self::initialize_state(&*client, &mut storage).await;
 
         tracing::info!("initialized state: {:?}", state);
+
+        drop(storage);
 
         let priority_ops_processor =
             PriorityOpsEventProcessor::new(state.next_expected_priority_id);
         let upgrades_processor = UpgradesEventProcessor::new(state.last_seen_version_id);
-        let mut event_processors: Vec<Box<dyn EventProcessor<W>>> = vec![
+        let mut event_processors: Vec<Box<dyn EventProcessor>> = vec![
             Box::new(priority_ops_processor),
             Box::new(upgrades_processor),
         ];
@@ -91,10 +92,14 @@ impl<W: EthClient + Sync> EthWatch<W> {
             poll_interval,
             event_processors,
             last_processed_ethereum_block: state.last_processed_ethereum_block,
+            pool,
         }
     }
 
-    async fn initialize_state(client: &W, storage: &mut StorageProcessor<'_>) -> EthWatchState {
+    async fn initialize_state(
+        client: &dyn EthClient,
+        storage: &mut Connection<'_, Core>,
+    ) -> EthWatchState {
         let next_expected_priority_id: PriorityOpId = storage
             .transactions_dal()
             .last_priority_id()
@@ -130,12 +135,9 @@ impl<W: EthClient + Sync> EthWatch<W> {
         }
     }
 
-    pub async fn run(
-        &mut self,
-        pool: ConnectionPool,
-        stop_receiver: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    pub async fn run(mut self, stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
         let mut timer = tokio::time::interval(self.poll_interval);
+        let pool = self.pool.clone();
         loop {
             if *stop_receiver.borrow() {
                 tracing::info!("Stop signal received, eth_watch is shutting down");
@@ -145,13 +147,13 @@ impl<W: EthClient + Sync> EthWatch<W> {
             timer.tick().await;
             METRICS.eth_poll.inc();
 
-            let mut storage = pool.access_storage_tagged("eth_watch").await.unwrap();
+            let mut storage = pool.connection_tagged("eth_watch").await.unwrap();
             if let Err(error) = self.loop_iteration(&mut storage).await {
                 // This is an error because otherwise we could potentially miss a priority operation
                 // thus entering priority mode, which is not desired.
                 tracing::error!("Failed to process new blocks {}", error);
                 self.last_processed_ethereum_block =
-                    Self::initialize_state(&self.client, &mut storage)
+                    Self::initialize_state(&*self.client, &mut storage)
                         .await
                         .last_processed_ethereum_block;
             }
@@ -160,7 +162,7 @@ impl<W: EthClient + Sync> EthWatch<W> {
     }
 
     #[tracing::instrument(skip(self, storage))]
-    async fn loop_iteration(&mut self, storage: &mut StorageProcessor<'_>) -> Result<(), Error> {
+    async fn loop_iteration(&mut self, storage: &mut Connection<'_, Core>) -> Result<(), Error> {
         let stage_latency = METRICS.poll_eth_node[&PollStage::Request].start();
         let to_block = self.client.finalized_block_number().await?;
         if to_block <= self.last_processed_ethereum_block {
@@ -179,7 +181,7 @@ impl<W: EthClient + Sync> EthWatch<W> {
 
         for processor in self.event_processors.iter_mut() {
             processor
-                .process_events(storage, &self.client, events.clone())
+                .process_events(storage, &*self.client, events.clone())
                 .await?;
         }
         self.last_processed_ethereum_block = to_block;
@@ -187,31 +189,29 @@ impl<W: EthClient + Sync> EthWatch<W> {
     }
 }
 
-pub async fn start_eth_watch<E: EthInterface + Send + Sync + 'static>(
-    pool: ConnectionPool,
-    eth_gateway: E,
+pub async fn start_eth_watch(
+    config: ETHWatchConfig,
+    pool: ConnectionPool<Core>,
+    eth_gateway: Arc<dyn EthInterface>,
     diamond_proxy_addr: Address,
-    governance: Option<(Contract, Address)>,
+    governance: (Contract, Address),
     stop_receiver: watch::Receiver<bool>,
 ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
-    let eth_watch = ETHWatchConfig::from_env().context("ETHWatchConfig::from_env()")?;
     let eth_client = EthHttpQueryClient::new(
         eth_gateway,
         diamond_proxy_addr,
-        governance.as_ref().map(|(_, address)| *address),
-        eth_watch.confirmations_for_eth_event,
+        Some(governance.1),
+        config.confirmations_for_eth_event,
     );
 
-    let mut eth_watch = EthWatch::new(
+    let eth_watch = EthWatch::new(
         diamond_proxy_addr,
-        governance.map(|(contract, _)| contract),
-        eth_client,
-        &pool,
-        eth_watch.poll_interval(),
+        Some(governance.0),
+        Box::new(eth_client),
+        pool,
+        config.poll_interval(),
     )
     .await;
 
-    Ok(tokio::spawn(async move {
-        eth_watch.run(pool, stop_receiver).await
-    }))
+    Ok(tokio::spawn(eth_watch.run(stop_receiver)))
 }

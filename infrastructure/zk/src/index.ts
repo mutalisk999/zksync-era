@@ -9,7 +9,7 @@ import { command as down } from './down';
 import { command as contract } from './contract';
 import { initCommand as init, reinitCommand as reinit, lightweightInitCommand as lightweightInit } from './init';
 import { initHyperchainCommand as initHyperchain } from './hyperchain_wizard';
-import { command as run } from './run/run';
+import { command as run } from './run';
 import { command as test } from './test/test';
 import { command as docker } from './docker';
 import { command as fmt } from './fmt';
@@ -20,6 +20,10 @@ import { command as config } from './config';
 import { command as clean } from './clean';
 import { command as db } from './database';
 import { command as verifyUpgrade } from './verify-upgrade';
+import { proverCommand } from './prover_setup';
+import { command as status } from './status';
+import { command as spellcheck } from './spellcheck';
+import { command as linkcheck } from './linkcheck';
 import * as env from './env';
 
 const COMMANDS = [
@@ -43,7 +47,11 @@ const COMMANDS = [
     clean,
     compiler,
     verifyUpgrade,
+    proverCommand,
     env.command,
+    status,
+    spellcheck,
+    linkcheck,
     completion(program as Command)
 ];
 

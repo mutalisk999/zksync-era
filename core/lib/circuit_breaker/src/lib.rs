@@ -4,25 +4,16 @@ use anyhow::Context as _;
 use futures::channel::oneshot;
 use thiserror::Error;
 use tokio::sync::watch;
-
 use zksync_config::configs::chain::CircuitBreakerConfig;
 
-use crate::facet_selectors::MismatchedFacetSelectorsError;
-
-pub mod facet_selectors;
 pub mod l1_txs;
 pub mod replication_lag;
 pub mod utils;
-
-#[cfg(test)]
-mod tests;
 
 #[derive(Debug, Error)]
 pub enum CircuitBreakerError {
     #[error("System has failed L1 transaction")]
     FailedL1Transaction,
-    #[error("Mismatched facet selectors: {0}")]
-    MismatchedFacetSelectors(MismatchedFacetSelectorsError),
     #[error("Replication lag ({0:?}) is above the threshold ({1:?})")]
     ReplicationLag(u32, u32),
 }
@@ -71,7 +62,7 @@ impl CircuitBreakerChecker {
                 return circuit_breaker_sender
                     .send(error)
                     .ok()
-                    .context("failed to send circuit breaker messsage");
+                    .context("failed to send circuit breaker message");
             }
             tokio::time::sleep(self.sync_interval).await;
         }

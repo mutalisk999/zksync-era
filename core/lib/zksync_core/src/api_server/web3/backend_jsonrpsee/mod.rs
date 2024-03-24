@@ -2,41 +2,66 @@
 //! Consists mostly of boilerplate code implementing the `jsonrpsee` server traits for the corresponding
 //! namespace structures defined in `zksync_core`.
 
-use std::error::Error;
-use zksync_web3_decl::error::Web3Error;
-use zksync_web3_decl::jsonrpsee::types::{error::ErrorCode, ErrorObjectOwned};
+use zksync_web3_decl::{
+    error::Web3Error,
+    jsonrpsee::types::{error::ErrorCode, ErrorObjectOwned},
+};
 
+pub(crate) use self::{
+    metadata::{MethodMetadata, MethodTracer},
+    middleware::{LimitMiddleware, MetadataMiddleware},
+};
+use crate::api_server::tx_sender::SubmitTxError;
+
+mod metadata;
+mod middleware;
 pub mod namespaces;
+#[cfg(test)]
+pub(crate) mod testonly;
 
-pub fn from_std_error(e: impl Error) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(ErrorCode::InternalError.code(), e.to_string(), Some(()))
-}
+impl MethodTracer {
+    pub(crate) fn map_err(&self, err: Web3Error) -> ErrorObjectOwned {
+        self.observe_error(&err);
 
-pub fn into_jsrpc_error(err: Web3Error) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(
-        match err {
-            Web3Error::InternalError | Web3Error::NotImplemented => ErrorCode::InternalError.code(),
+        let data = match &err {
+            Web3Error::SubmitTransactionError(_, data) => Some(format!("0x{}", hex::encode(data))),
+            Web3Error::ProxyError(_) => Some("0x".to_owned()),
+            _ => None,
+        };
+        let code = match err {
+            Web3Error::InternalError(_) | Web3Error::NotImplemented => {
+                ErrorCode::InternalError.code()
+            }
             Web3Error::NoBlock
-            | Web3Error::NoSuchFunction
-            | Web3Error::RLPError(_)
-            | Web3Error::InvalidTransactionData(_)
+            | Web3Error::PrunedBlock(_)
+            | Web3Error::PrunedL1Batch(_)
             | Web3Error::TooManyTopics
             | Web3Error::FilterNotFound
-            | Web3Error::InvalidFeeParams(_)
             | Web3Error::InvalidFilterBlockHash
-            | Web3Error::LogsLimitExceeded(_, _, _)
-            | Web3Error::TooManyLogs(_) => ErrorCode::InvalidParams.code(),
-            Web3Error::SubmitTransactionError(_, _) | Web3Error::SerializationError(_) => 3,
-            Web3Error::PubSubTimeout => 4,
-            Web3Error::RequestTimeout => 5,
-        },
-        match err {
-            Web3Error::SubmitTransactionError(ref message, _) => message.clone(),
+            | Web3Error::LogsLimitExceeded(_, _, _) => ErrorCode::InvalidParams.code(),
+            Web3Error::SubmitTransactionError(_, _)
+            | Web3Error::SerializationError(_)
+            | Web3Error::ProxyError(_) => 3,
+            Web3Error::TreeApiUnavailable => 6,
+        };
+        let message = match err {
+            // Do not expose internal error details to the client.
+            Web3Error::InternalError(_) => "Internal error".to_owned(),
+            Web3Error::ProxyError(err) => err.as_ref().to_string(),
+            Web3Error::SubmitTransactionError(message, _) => message,
             _ => err.to_string(),
-        },
+        };
+
+        ErrorObjectOwned::owned(code, message, data)
+    }
+}
+
+impl From<SubmitTxError> for Web3Error {
+    fn from(err: SubmitTxError) -> Self {
         match err {
-            Web3Error::SubmitTransactionError(_, data) => Some(format!("0x{}", hex::encode(data))),
-            _ => None,
-        },
-    )
+            SubmitTxError::Internal(err) => Self::InternalError(err),
+            SubmitTxError::ProxyError(err) => Self::ProxyError(err),
+            _ => Self::SubmitTransactionError(err.to_string(), err.data()),
+        }
+    }
 }

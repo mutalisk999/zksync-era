@@ -1,24 +1,23 @@
-use std::collections::HashMap;
-use std::convert::TryInto;
-use std::sync::Arc;
+use std::{collections::HashMap, convert::TryInto, sync::Arc};
 
 use tokio::sync::RwLock;
-
-use zksync_contracts::zksync_contract;
-use zksync_dal::{ConnectionPool, StorageProcessor};
-use zksync_types::protocol_version::{ProtocolUpgradeTx, ProtocolUpgradeTxCommonData};
-use zksync_types::web3::types::{Address, BlockNumber};
+use zksync_contracts::{governance_contract, zksync_contract};
+use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_types::{
-    ethabi::{encode, Contract, Hash, Token},
+    ethabi::{encode, Hash, Token},
     l1::{L1Tx, OpProcessingType, PriorityQueueType},
-    web3::types::Log,
+    protocol_upgrade::{ProtocolUpgradeTx, ProtocolUpgradeTxCommonData},
+    web3::types::{Address, BlockNumber, Log},
     Execute, L1TxCommonData, PriorityOpId, ProtocolUpgrade, ProtocolVersion, ProtocolVersionId,
     Transaction, H256, U256,
 };
 
 use super::client::Error;
-use crate::eth_watch::{client::EthClient, EthWatch};
+use crate::eth_watch::{
+    client::EthClient, event_processors::upgrades::UPGRADE_PROPOSAL_SIGNATURE, EthWatch,
+};
 
+#[derive(Debug)]
 struct FakeEthClientData {
     transactions: HashMap<u64, Vec<Log>>,
     diamond_upgrades: HashMap<u64, Vec<Log>>,
@@ -69,7 +68,7 @@ impl FakeEthClientData {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct FakeEthClient {
     inner: Arc<RwLock<FakeEthClientData>>,
 }
@@ -203,20 +202,20 @@ fn build_upgrade_tx(id: ProtocolVersionId, eth_block: u64) -> ProtocolUpgradeTx 
 
 #[tokio::test]
 async fn test_normal_operation_l1_txs() {
-    let connection_pool = ConnectionPool::test_pool().await;
+    let connection_pool = ConnectionPool::<Core>::test_pool().await;
     setup_db(&connection_pool).await;
 
     let mut client = FakeEthClient::new();
     let mut watcher = EthWatch::new(
         Address::default(),
         None,
-        client.clone(),
-        &connection_pool,
+        Box::new(client.clone()),
+        connection_pool.clone(),
         std::time::Duration::from_nanos(1),
     )
     .await;
 
-    let mut storage = connection_pool.access_storage().await.unwrap();
+    let mut storage = connection_pool.connection().await.unwrap();
     client
         .add_transactions(&[build_l1_tx(0, 10), build_l1_tx(1, 14), build_l1_tx(2, 18)])
         .await;
@@ -251,20 +250,20 @@ async fn test_normal_operation_l1_txs() {
 
 #[tokio::test]
 async fn test_normal_operation_upgrades() {
-    let connection_pool = ConnectionPool::test_pool().await;
+    let connection_pool = ConnectionPool::<Core>::test_pool().await;
     setup_db(&connection_pool).await;
 
     let mut client = FakeEthClient::new();
     let mut watcher = EthWatch::new(
         Address::default(),
         None,
-        client.clone(),
-        &connection_pool,
+        Box::new(client.clone()),
+        connection_pool.clone(),
         std::time::Duration::from_nanos(1),
     )
     .await;
 
-    let mut storage = connection_pool.access_storage().await.unwrap();
+    let mut storage = connection_pool.connection().await.unwrap();
     client
         .add_diamond_upgrades(&[
             (
@@ -312,20 +311,20 @@ async fn test_normal_operation_upgrades() {
 
 #[tokio::test]
 async fn test_gap_in_upgrades() {
-    let connection_pool = ConnectionPool::test_pool().await;
+    let connection_pool = ConnectionPool::<Core>::test_pool().await;
     setup_db(&connection_pool).await;
 
     let mut client = FakeEthClient::new();
     let mut watcher = EthWatch::new(
         Address::default(),
         None,
-        client.clone(),
-        &connection_pool,
+        Box::new(client.clone()),
+        connection_pool.clone(),
         std::time::Duration::from_nanos(1),
     )
     .await;
 
-    let mut storage = connection_pool.access_storage().await.unwrap();
+    let mut storage = connection_pool.connection().await.unwrap();
     client
         .add_diamond_upgrades(&[(
             ProtocolUpgrade {
@@ -351,20 +350,20 @@ async fn test_gap_in_upgrades() {
 
 #[tokio::test]
 async fn test_normal_operation_governance_upgrades() {
-    let connection_pool = ConnectionPool::test_pool().await;
+    let connection_pool = ConnectionPool::<Core>::test_pool().await;
     setup_db(&connection_pool).await;
 
     let mut client = FakeEthClient::new();
     let mut watcher = EthWatch::new(
         Address::default(),
         Some(governance_contract()),
-        client.clone(),
-        &connection_pool,
+        Box::new(client.clone()),
+        connection_pool.clone(),
         std::time::Duration::from_nanos(1),
     )
     .await;
 
-    let mut storage = connection_pool.access_storage().await.unwrap();
+    let mut storage = connection_pool.connection().await.unwrap();
     client
         .add_governance_upgrades(&[
             (
@@ -413,20 +412,20 @@ async fn test_normal_operation_governance_upgrades() {
 #[tokio::test]
 #[should_panic]
 async fn test_gap_in_single_batch() {
-    let connection_pool = ConnectionPool::test_pool().await;
+    let connection_pool = ConnectionPool::<Core>::test_pool().await;
     setup_db(&connection_pool).await;
 
     let mut client = FakeEthClient::new();
     let mut watcher = EthWatch::new(
         Address::default(),
         None,
-        client.clone(),
-        &connection_pool,
+        Box::new(client.clone()),
+        connection_pool.clone(),
         std::time::Duration::from_nanos(1),
     )
     .await;
 
-    let mut storage = connection_pool.access_storage().await.unwrap();
+    let mut storage = connection_pool.connection().await.unwrap();
     client
         .add_transactions(&[
             build_l1_tx(0, 10),
@@ -443,20 +442,20 @@ async fn test_gap_in_single_batch() {
 #[tokio::test]
 #[should_panic]
 async fn test_gap_between_batches() {
-    let connection_pool = ConnectionPool::test_pool().await;
+    let connection_pool = ConnectionPool::<Core>::test_pool().await;
     setup_db(&connection_pool).await;
 
     let mut client = FakeEthClient::new();
     let mut watcher = EthWatch::new(
         Address::default(),
         None,
-        client.clone(),
-        &connection_pool,
+        Box::new(client.clone()),
+        connection_pool.clone(),
         std::time::Duration::from_nanos(1),
     )
     .await;
 
-    let mut storage = connection_pool.access_storage().await.unwrap();
+    let mut storage = connection_pool.connection().await.unwrap();
     client
         .add_transactions(&[
             // this goes to the first batch
@@ -478,20 +477,20 @@ async fn test_gap_between_batches() {
 
 #[tokio::test]
 async fn test_overlapping_batches() {
-    let connection_pool = ConnectionPool::test_pool().await;
+    let connection_pool = ConnectionPool::<Core>::test_pool().await;
     setup_db(&connection_pool).await;
 
     let mut client = FakeEthClient::new();
     let mut watcher = EthWatch::new(
         Address::default(),
         None,
-        client.clone(),
-        &connection_pool,
+        Box::new(client.clone()),
+        connection_pool.clone(),
         std::time::Duration::from_nanos(1),
     )
     .await;
 
-    let mut storage = connection_pool.access_storage().await.unwrap();
+    let mut storage = connection_pool.connection().await.unwrap();
     client
         .add_transactions(&[
             // this goes to the first batch
@@ -524,13 +523,13 @@ async fn test_overlapping_batches() {
     assert_eq!(tx.common_data.serial_id.0, 4);
 }
 
-async fn get_all_db_txs(storage: &mut StorageProcessor<'_>) -> Vec<Transaction> {
-    storage.transactions_dal().reset_mempool().await;
+async fn get_all_db_txs(storage: &mut Connection<'_, Core>) -> Vec<Transaction> {
+    storage.transactions_dal().reset_mempool().await.unwrap();
     storage
         .transactions_dal()
-        .sync_mempool(vec![], vec![], 0, 0, 1000)
+        .sync_mempool(&[], &[], 0, 0, 1000)
         .await
-        .0
+        .unwrap()
 }
 
 fn tx_into_log(tx: L1Tx) -> Log {
@@ -591,10 +590,7 @@ fn upgrade_into_diamond_proxy_log(upgrade: ProtocolUpgrade, eth_block: u64) -> L
     let data = encode(&[diamond_cut, Token::FixedBytes(vec![0u8; 32])]);
     Log {
         address: Address::repeat_byte(0x1),
-        topics: vec![zksync_contract()
-            .event("ProposeTransparentUpgrade")
-            .expect("ProposeTransparentUpgrade event is missing in abi")
-            .signature()],
+        topics: vec![UPGRADE_PROPOSAL_SIGNATURE],
         data: data.into(),
         block_hash: Some(H256::repeat_byte(0x11)),
         block_number: Some(eth_block.into()),
@@ -765,9 +761,9 @@ fn upgrade_into_diamond_cut(upgrade: ProtocolUpgrade) -> Token {
     ])
 }
 
-async fn setup_db(connection_pool: &ConnectionPool) {
+async fn setup_db(connection_pool: &ConnectionPool<Core>) {
     connection_pool
-        .access_storage()
+        .connection()
         .await
         .unwrap()
         .protocol_versions_dal()
@@ -776,69 +772,4 @@ async fn setup_db(connection_pool: &ConnectionPool) {
             ..Default::default()
         })
         .await;
-}
-
-fn governance_contract() -> Contract {
-    let json = r#"[
-        {
-          "anonymous": false,
-          "inputs": [
-            {
-              "indexed": true,
-              "internalType": "bytes32",
-              "name": "_id",
-              "type": "bytes32"
-            },
-            {
-              "indexed": false,
-              "internalType": "uint256",
-              "name": "delay",
-              "type": "uint256"
-            },
-            {
-              "components": [
-                {
-                  "components": [
-                    {
-                      "internalType": "address",
-                      "name": "target",
-                      "type": "address"
-                    },
-                    {
-                      "internalType": "uint256",
-                      "name": "value",
-                      "type": "uint256"
-                    },
-                    {
-                      "internalType": "bytes",
-                      "name": "data",
-                      "type": "bytes"
-                    }
-                  ],
-                  "internalType": "struct IGovernance.Call[]",
-                  "name": "calls",
-                  "type": "tuple[]"
-                },
-                {
-                  "internalType": "bytes32",
-                  "name": "predecessor",
-                  "type": "bytes32"
-                },
-                {
-                  "internalType": "bytes32",
-                  "name": "salt",
-                  "type": "bytes32"
-                }
-              ],
-              "indexed": false,
-              "internalType": "struct IGovernance.Operation",
-              "name": "_operation",
-              "type": "tuple"
-            }
-          ],
-          "name": "TransparentOperationScheduled",
-          "type": "event"
-        }
-    ]"#;
-    serde_json::from_str(json).unwrap()
 }

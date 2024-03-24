@@ -1,11 +1,9 @@
-use anyhow::Context as _;
+use std::{net::SocketAddr, num::NonZeroU32, time::Duration};
+
 use serde::Deserialize;
-
-use std::{net::SocketAddr, time::Duration};
-
-use super::envy_load;
-pub use crate::configs::PrometheusConfig;
 use zksync_basic_types::H256;
+
+pub use crate::configs::PrometheusConfig;
 
 /// API configuration.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -22,19 +20,6 @@ pub struct ApiConfig {
     pub merkle_tree: MerkleTreeApiConfig,
 }
 
-impl ApiConfig {
-    pub fn from_env() -> anyhow::Result<Self> {
-        Ok(Self {
-            web3_json_rpc: Web3JsonRpcConfig::from_env().context("Web3JsonRpcConfig")?,
-            contract_verification: ContractVerificationApiConfig::from_env()
-                .context("ContractVerificationApiConfig")?,
-            prometheus: PrometheusConfig::from_env().context("PrometheusConfig")?,
-            healthcheck: HealthCheckConfig::from_env().context("HealthCheckConfig")?,
-            merkle_tree: MerkleTreeApiConfig::from_env().context("MerkleTreeApiConfig")?,
-        })
-    }
-}
-
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct Web3JsonRpcConfig {
     /// Port to which the HTTP RPC server is listening.
@@ -47,21 +32,26 @@ pub struct Web3JsonRpcConfig {
     pub ws_url: String,
     /// Max possible limit of entities to be requested once.
     pub req_entities_limit: Option<u32>,
+    /// Whether to support methods installing filters and querying filter changes.
+    ///
+    /// When to set this value to `true`:
+    /// Filters are local to the specific node they were created at. Meaning if
+    /// there are multiple nodes behind a load balancer the client cannot reliably
+    /// query the previously created filter as the request might get routed to a
+    /// different node.
+    #[serde(default)]
+    pub filters_disabled: bool,
     /// Max possible limit of filters to be in the state at once.
     pub filters_limit: Option<u32>,
     /// Max possible limit of subscriptions to be in the state at once.
     pub subscriptions_limit: Option<u32>,
     /// Interval between polling db for pubsub (in ms).
     pub pubsub_polling_interval: Option<u64>,
-    /// number of threads per server
-    pub threads_per_server: u32,
     /// Tx nonce: how far ahead from the committed nonce can it be.
     pub max_nonce_ahead: u32,
     /// The multiplier to use when suggesting gas price. Should be higher than one,
     /// otherwise if the L1 prices soar, the suggested gas price won't be sufficient to be included in block
     pub gas_price_scale_factor: f64,
-    /// Inbound transaction limit used for throttling
-    pub transactions_per_sec_limit: Option<u32>,
     /// Timeout for requests (in s)
     pub request_timeout: Option<u64>,
     /// Private keys for accounts managed by node
@@ -70,9 +60,17 @@ pub struct Web3JsonRpcConfig {
     pub estimate_gas_scale_factor: f64,
     /// The max possible number of gas that `eth_estimateGas` is allowed to overestimate.
     pub estimate_gas_acceptable_overestimation: u32,
+    /// Whether to use the compatibility mode for gas estimation for L1->L2 transactions.
+    /// During the migration to the 1.4.1 fee model, there will be a period, when the server
+    /// will already have the 1.4.1 fee model, while the L1 contracts will still expect the transactions
+    /// to use the previous fee model with much higher overhead.
+    ///
+    /// When set to `true`, the API will ensure to return gasLimit is high enough overhead for both the old
+    /// and the new fee model when estimating L1->L2 transactions.  
+    pub l1_to_l2_transactions_compatibility_mode: bool,
     ///  Max possible size of an ABI encoded tx (in bytes).
     pub max_tx_size: usize,
-    /// Max number of cache misses during one VM execution. If the number of cache misses exceeds this value, the api server panics.
+    /// Max number of cache misses during one VM execution. If the number of cache misses exceeds this value, the API server panics.
     /// This is a temporary solution to mitigate API request resulting in thousands of DB queries.
     pub vm_execution_cache_misses_limit: Option<usize>,
     /// Max number of VM instances to be concurrently spawned by the API server.
@@ -86,12 +84,6 @@ pub struct Web3JsonRpcConfig {
     /// Latest values cache size in MiBs. The default value is 128 MiB. If set to 0, the latest
     /// values cache will be disabled.
     pub latest_values_cache_size_mb: Option<usize>,
-    /// Override value for the amount of threads used for HTTP RPC server.
-    /// If not set, the value from `threads_per_server` is used.
-    pub http_threads: Option<u32>,
-    /// Override value for the amount of threads used for WebSocket RPC server.
-    /// If not set, the value from `threads_per_server` is used.
-    pub ws_threads: Option<u32>,
     /// Limit for fee history block range.
     pub fee_history_limit: Option<u64>,
     /// Maximum number of requests in a single batch JSON RPC request. Default is 500.
@@ -101,12 +93,52 @@ pub struct Web3JsonRpcConfig {
     /// Maximum number of requests per minute for the WebSocket server.
     /// The value is per active connection.
     /// Note: For HTTP, rate limiting is expected to be configured on the infra level.
-    pub websocket_requests_per_minute_limit: Option<u32>,
+    pub websocket_requests_per_minute_limit: Option<NonZeroU32>,
+    /// Tree API url, currently used to proxy `getProof` calls to the tree
+    pub tree_api_url: Option<String>,
+    /// Polling period for mempool cache update - how often the mempool cache is updated from the database.
+    /// In milliseconds. Default is 50 milliseconds.
+    pub mempool_cache_update_interval: Option<u64>,
+    /// Maximum number of transactions to be stored in the mempool cache. Default is 10000.
+    pub mempool_cache_size: Option<usize>,
 }
 
 impl Web3JsonRpcConfig {
-    pub fn from_env() -> anyhow::Result<Self> {
-        envy_load("web3_json_rpc", "API_WEB3_JSON_RPC_")
+    /// Creates a mock instance of `Web3JsonRpcConfig` to be used in tests.
+    /// Ports and some fields that may affect execution are set to the same values used by default in
+    /// the localhost environment. Other fields are set to default values.
+    pub fn for_tests() -> Self {
+        Self {
+            http_port: 3050,
+            http_url: "http://localhost:3050".into(),
+            ws_port: 3051,
+            ws_url: "ws://localhost:3051".into(),
+            req_entities_limit: Some(10000),
+            filters_disabled: false,
+            filters_limit: Some(10000),
+            subscriptions_limit: Some(10000),
+            pubsub_polling_interval: Some(200),
+            max_nonce_ahead: 50,
+            gas_price_scale_factor: 1.2,
+            request_timeout: Default::default(),
+            account_pks: Default::default(),
+            estimate_gas_scale_factor: 1.2,
+            estimate_gas_acceptable_overestimation: 1000,
+            l1_to_l2_transactions_compatibility_mode: true,
+            max_tx_size: 1000000,
+            vm_execution_cache_misses_limit: Default::default(),
+            vm_concurrency_limit: Default::default(),
+            factory_deps_cache_size_mb: Default::default(),
+            initial_writes_cache_size_mb: Default::default(),
+            latest_values_cache_size_mb: Default::default(),
+            fee_history_limit: Default::default(),
+            max_batch_request_size: Default::default(),
+            max_response_body_size_mb: Default::default(),
+            websocket_requests_per_minute_limit: Default::default(),
+            mempool_cache_update_interval: Default::default(),
+            mempool_cache_size: Default::default(),
+            tree_api_url: None,
+        }
     }
 
     pub fn http_bind_addr(&self) -> SocketAddr {
@@ -163,14 +195,6 @@ impl Web3JsonRpcConfig {
         self.latest_values_cache_size_mb.unwrap_or(128) * super::BYTES_IN_MEGABYTE
     }
 
-    pub fn http_server_threads(&self) -> usize {
-        self.http_threads.unwrap_or(self.threads_per_server) as usize
-    }
-
-    pub fn ws_server_threads(&self) -> usize {
-        self.ws_threads.unwrap_or(self.threads_per_server) as usize
-    }
-
     pub fn fee_history_limit(&self) -> u64 {
         self.fee_history_limit.unwrap_or(1024)
     }
@@ -184,9 +208,22 @@ impl Web3JsonRpcConfig {
         self.max_response_body_size_mb.unwrap_or(10) * super::BYTES_IN_MEGABYTE
     }
 
-    pub fn websocket_requests_per_minute_limit(&self) -> u32 {
+    pub fn websocket_requests_per_minute_limit(&self) -> NonZeroU32 {
         // The default limit is chosen to be reasonably permissive.
-        self.websocket_requests_per_minute_limit.unwrap_or(6000)
+        self.websocket_requests_per_minute_limit
+            .unwrap_or(NonZeroU32::new(6000).unwrap())
+    }
+
+    pub fn tree_api_url(&self) -> Option<&str> {
+        self.tree_api_url.as_deref()
+    }
+
+    pub fn mempool_cache_update_interval(&self) -> Duration {
+        Duration::from_millis(self.mempool_cache_update_interval.unwrap_or(50))
+    }
+
+    pub fn mempool_cache_size(&self) -> usize {
+        self.mempool_cache_size.unwrap_or(10_000)
     }
 }
 
@@ -194,15 +231,25 @@ impl Web3JsonRpcConfig {
 pub struct HealthCheckConfig {
     /// Port to which the REST server is listening.
     pub port: u16,
+    /// Time limit in milliseconds to mark a health check as slow and log the corresponding warning.
+    /// If not specified, the default value in the health check crate will be used.
+    pub slow_time_limit_ms: Option<u64>,
+    /// Time limit in milliseconds to abort a health check and return "not ready" status for the corresponding component.
+    /// If not specified, the default value in the health check crate will be used.
+    pub hard_time_limit_ms: Option<u64>,
 }
 
 impl HealthCheckConfig {
-    pub fn from_env() -> anyhow::Result<Self> {
-        envy_load("healthcheck", "API_HEALTHCHECK_")
-    }
-
     pub fn bind_addr(&self) -> SocketAddr {
         SocketAddr::new("0.0.0.0".parse().unwrap(), self.port)
+    }
+
+    pub fn slow_time_limit(&self) -> Option<Duration> {
+        self.slow_time_limit_ms.map(Duration::from_millis)
+    }
+
+    pub fn hard_time_limit(&self) -> Option<Duration> {
+        self.hard_time_limit_ms.map(Duration::from_millis)
     }
 }
 
@@ -212,17 +259,11 @@ pub struct ContractVerificationApiConfig {
     pub port: u16,
     /// URL to access REST server.
     pub url: String,
-    /// number of threads per server
-    pub threads_per_server: u32,
 }
 
 impl ContractVerificationApiConfig {
     pub fn bind_addr(&self) -> SocketAddr {
         SocketAddr::new("0.0.0.0".parse().unwrap(), self.port)
-    }
-
-    pub fn from_env() -> anyhow::Result<Self> {
-        envy_load("contract_verification", "API_CONTRACT_VERIFICATION_")
     }
 }
 
@@ -237,132 +278,5 @@ pub struct MerkleTreeApiConfig {
 impl MerkleTreeApiConfig {
     const fn default_port() -> u16 {
         3_072
-    }
-
-    /// Loads configuration from env variables.
-    pub fn from_env() -> anyhow::Result<Self> {
-        envy_load("merkle_tree_api", "API_MERKLE_TREE_")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::IpAddr;
-
-    use super::*;
-    use crate::configs::test_utils::{hash, EnvMutex};
-
-    static MUTEX: EnvMutex = EnvMutex::new();
-
-    fn expected_config() -> ApiConfig {
-        ApiConfig {
-            web3_json_rpc: Web3JsonRpcConfig {
-                http_port: 3050,
-                http_url: "http://127.0.0.1:3050".into(),
-                ws_port: 3051,
-                ws_url: "ws://127.0.0.1:3051".into(),
-                req_entities_limit: Some(10000),
-                filters_limit: Some(10000),
-                subscriptions_limit: Some(10000),
-                pubsub_polling_interval: Some(200),
-                threads_per_server: 128,
-                max_nonce_ahead: 5,
-                transactions_per_sec_limit: Some(1000),
-                request_timeout: Some(10),
-                account_pks: Some(vec![
-                    hash("0x0000000000000000000000000000000000000000000000000000000000000001"),
-                    hash("0x0000000000000000000000000000000000000000000000000000000000000002"),
-                ]),
-                estimate_gas_scale_factor: 1.0f64,
-                gas_price_scale_factor: 1.2,
-                estimate_gas_acceptable_overestimation: 1000,
-                max_tx_size: 1000000,
-                vm_execution_cache_misses_limit: None,
-                vm_concurrency_limit: Some(512),
-                factory_deps_cache_size_mb: Some(128),
-                initial_writes_cache_size_mb: Some(32),
-                latest_values_cache_size_mb: Some(256),
-                http_threads: Some(128),
-                ws_threads: Some(256),
-                fee_history_limit: Some(100),
-                max_batch_request_size: Some(200),
-                max_response_body_size_mb: Some(10),
-                websocket_requests_per_minute_limit: Some(10),
-            },
-            contract_verification: ContractVerificationApiConfig {
-                port: 3070,
-                url: "http://127.0.0.1:3070".into(),
-                threads_per_server: 128,
-            },
-            prometheus: PrometheusConfig {
-                listener_port: 3312,
-                pushgateway_url: "http://127.0.0.1:9091".into(),
-                push_interval_ms: Some(100),
-            },
-            healthcheck: HealthCheckConfig { port: 8081 },
-            merkle_tree: MerkleTreeApiConfig { port: 8082 },
-        }
-    }
-
-    #[test]
-    fn from_env() {
-        let mut lock = MUTEX.lock();
-        let config = r#"
-            API_WEB3_JSON_RPC_HTTP_PORT="3050"
-            API_WEB3_JSON_RPC_HTTP_URL="http://127.0.0.1:3050"
-            API_WEB3_JSON_RPC_WS_PORT="3051"
-            API_WEB3_JSON_RPC_WS_URL="ws://127.0.0.1:3051"
-            API_WEB3_JSON_RPC_REQ_ENTITIES_LIMIT=10000
-            API_WEB3_JSON_RPC_FILTERS_LIMIT=10000
-            API_WEB3_JSON_RPC_SUBSCRIPTIONS_LIMIT=10000
-            API_WEB3_JSON_RPC_PUBSUB_POLLING_INTERVAL=200
-            API_WEB3_JSON_RPC_THREADS_PER_SERVER=128
-            API_WEB3_JSON_RPC_MAX_NONCE_AHEAD=5
-            API_WEB3_JSON_RPC_GAS_PRICE_SCALE_FACTOR=1.2
-            API_WEB3_JSON_RPC_TRANSACTIONS_PER_SEC_LIMIT=1000
-            API_WEB3_JSON_RPC_REQUEST_TIMEOUT=10
-            API_WEB3_JSON_RPC_ACCOUNT_PKS="0x0000000000000000000000000000000000000000000000000000000000000001,0x0000000000000000000000000000000000000000000000000000000000000002"
-            API_WEB3_JSON_RPC_ESTIMATE_GAS_SCALE_FACTOR=1.0
-            API_WEB3_JSON_RPC_ESTIMATE_GAS_ACCEPTABLE_OVERESTIMATION=1000
-            API_WEB3_JSON_RPC_MAX_TX_SIZE=1000000
-            API_WEB3_JSON_RPC_VM_CONCURRENCY_LIMIT=512
-            API_WEB3_JSON_RPC_FACTORY_DEPS_CACHE_SIZE_MB=128
-            API_WEB3_JSON_RPC_INITIAL_WRITES_CACHE_SIZE_MB=32
-            API_WEB3_JSON_RPC_LATEST_VALUES_CACHE_SIZE_MB=256
-            API_WEB3_JSON_RPC_HTTP_THREADS=128
-            API_WEB3_JSON_RPC_WS_THREADS=256
-            API_WEB3_JSON_RPC_FEE_HISTORY_LIMIT=100
-            API_WEB3_JSON_RPC_MAX_BATCH_REQUEST_SIZE=200
-            API_WEB3_JSON_RPC_WEBSOCKET_REQUESTS_PER_MINUTE_LIMIT=10
-            API_CONTRACT_VERIFICATION_PORT="3070"
-            API_CONTRACT_VERIFICATION_URL="http://127.0.0.1:3070"
-            API_CONTRACT_VERIFICATION_THREADS_PER_SERVER=128
-            API_WEB3_JSON_RPC_MAX_RESPONSE_BODY_SIZE_MB=10
-            API_PROMETHEUS_LISTENER_PORT="3312"
-            API_PROMETHEUS_PUSHGATEWAY_URL="http://127.0.0.1:9091"
-            API_PROMETHEUS_PUSH_INTERVAL_MS=100
-            API_HEALTHCHECK_PORT=8081
-            API_MERKLE_TREE_PORT=8082
-        "#;
-        lock.set_env(config);
-
-        let actual = ApiConfig::from_env().unwrap();
-        assert_eq!(actual, expected_config());
-    }
-
-    /// Checks the correctness of the config helper methods.
-    #[test]
-    fn methods() {
-        let config = expected_config();
-        let bind_broadcast_addr: IpAddr = "0.0.0.0".parse().unwrap();
-
-        assert_eq!(
-            config.web3_json_rpc.pubsub_interval(),
-            Duration::from_millis(200)
-        );
-        assert_eq!(
-            config.contract_verification.bind_addr(),
-            SocketAddr::new(bind_broadcast_addr, config.contract_verification.port)
-        );
     }
 }

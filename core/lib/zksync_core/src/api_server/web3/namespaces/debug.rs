@@ -1,61 +1,59 @@
-use multivm::vm_latest::constants::BLOCK_GAS_LIMIT;
-use once_cell::sync::OnceCell;
 use std::sync::Arc;
 
-use multivm::interface::ExecutionResult;
-
-use zksync_dal::ConnectionPool;
-use zksync_state::PostgresStorageCaches;
+use anyhow::Context as _;
+use multivm::{interface::ExecutionResult, vm_latest::constants::BLOCK_GAS_LIMIT};
+use once_cell::sync::OnceCell;
+use zksync_dal::CoreDal;
+use zksync_system_constants::MAX_ENCODED_TX_SIZE;
 use zksync_types::{
     api::{BlockId, BlockNumber, DebugCall, ResultDebugCall, TracerConfig},
+    debug_flat_call::{flatten_debug_calls, DebugCallFlat},
+    fee_model::BatchFeeInput,
     l2::L2Tx,
     transaction_request::CallRequest,
     vm_trace::Call,
-    AccountTreeId, L2ChainId, H256, USED_BOOTLOADER_MEMORY_BYTES,
+    AccountTreeId, H256,
 };
 use zksync_web3_decl::error::Web3Error;
 
 use crate::api_server::{
-    execution_sandbox::{
-        execute_tx_eth_call, ApiTracer, BlockArgs, TxSharedArgs, VmConcurrencyLimiter,
-    },
-    tx_sender::ApiContracts,
-    web3::{
-        backend_jsonrpc::error::internal_error,
-        metrics::API_METRICS,
-        resolve_block,
-        state::{RpcState, SealedMiniblockNumber},
-    },
+    execution_sandbox::{ApiTracer, TxSharedArgs},
+    tx_sender::{ApiContracts, TxSenderConfig},
+    web3::{backend_jsonrpsee::MethodTracer, state::RpcState},
 };
-use crate::l1_gas_price::L1GasPriceProvider;
 
 #[derive(Debug, Clone)]
-pub struct DebugNamespace {
-    connection_pool: ConnectionPool,
-    fair_l2_gas_price: u64,
+pub(crate) struct DebugNamespace {
+    batch_fee_input: BatchFeeInput,
+    state: RpcState,
     api_contracts: ApiContracts,
-    vm_execution_cache_misses_limit: Option<usize>,
-    vm_concurrency_limiter: Arc<VmConcurrencyLimiter>,
-    storage_caches: PostgresStorageCaches,
-    last_sealed_miniblock: SealedMiniblockNumber,
-    chain_id: L2ChainId,
 }
 
 impl DebugNamespace {
-    pub async fn new<G: L1GasPriceProvider>(state: RpcState<G>) -> Self {
-        let sender_config = &state.tx_sender.0.sender_config;
-
+    pub async fn new(state: RpcState) -> Self {
         let api_contracts = ApiContracts::load_from_disk();
         Self {
-            connection_pool: state.connection_pool,
-            fair_l2_gas_price: sender_config.fair_l2_gas_price,
+            // For now, the same scaling is used for both the L1 gas price and the pubdata price
+            batch_fee_input: state
+                .tx_sender
+                .0
+                .batch_fee_input_provider
+                .get_batch_fee_input_scaled(
+                    state.api_config.estimate_gas_scale_factor,
+                    state.api_config.estimate_gas_scale_factor,
+                )
+                .await,
+            state,
             api_contracts,
-            vm_execution_cache_misses_limit: sender_config.vm_execution_cache_misses_limit,
-            vm_concurrency_limiter: state.tx_sender.vm_concurrency_limiter(),
-            storage_caches: state.tx_sender.storage_caches(),
-            last_sealed_miniblock: state.last_sealed_miniblock,
-            chain_id: sender_config.chain_id,
         }
+    }
+
+    fn sender_config(&self) -> &TxSenderConfig {
+        &self.state.tx_sender.0.sender_config
+    }
+
+    pub(crate) fn current_method(&self) -> &MethodTracer {
+        &self.state.current_method
     }
 
     #[tracing::instrument(skip(self))]
@@ -64,23 +62,22 @@ impl DebugNamespace {
         block_id: BlockId,
         options: Option<TracerConfig>,
     ) -> Result<Vec<ResultDebugCall>, Web3Error> {
-        const METHOD_NAME: &str = "debug_trace_block";
+        self.current_method().set_block_id(block_id);
 
-        let method_latency = API_METRICS.start_block_call(METHOD_NAME, block_id);
         let only_top_call = options
             .map(|options| options.tracer_config.only_top_call)
             .unwrap_or(false);
-        let mut connection = self
-            .connection_pool
-            .access_storage_tagged("api")
-            .await
-            .unwrap();
-        let block_number = resolve_block(&mut connection, block_id, METHOD_NAME).await?;
-        let call_trace = connection
+        let mut connection = self.state.connection_pool.connection_tagged("api").await?;
+        let block_number = self.state.resolve_block(&mut connection, block_id).await?;
+        self.current_method()
+            .set_block_diff(self.state.last_sealed_miniblock.diff(block_number));
+
+        let call_traces = connection
             .blocks_web3_dal()
-            .get_trace_for_miniblock(block_number)
-            .await;
-        let call_trace = call_trace
+            .get_traces_for_miniblock(block_number)
+            .await
+            .context("get_traces_for_miniblock")?;
+        let call_trace = call_traces
             .into_iter()
             .map(|call_trace| {
                 let mut result: DebugCall = call_trace.into();
@@ -90,10 +87,18 @@ impl DebugNamespace {
                 ResultDebugCall { result }
             })
             .collect();
-
-        let block_diff = self.last_sealed_miniblock.diff(block_number);
-        method_latency.observe(block_diff);
         Ok(call_trace)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn debug_trace_block_flat_impl(
+        &self,
+        block_id: BlockId,
+        options: Option<TracerConfig>,
+    ) -> Result<Vec<DebugCallFlat>, Web3Error> {
+        let call_trace = self.debug_trace_block_impl(block_id, options).await?;
+        let call_trace_flat = flatten_debug_calls(call_trace);
+        Ok(call_trace_flat)
     }
 
     #[tracing::instrument(skip(self))]
@@ -101,25 +106,23 @@ impl DebugNamespace {
         &self,
         tx_hash: H256,
         options: Option<TracerConfig>,
-    ) -> Option<DebugCall> {
+    ) -> Result<Option<DebugCall>, Web3Error> {
         let only_top_call = options
             .map(|options| options.tracer_config.only_top_call)
             .unwrap_or(false);
-        let call_trace = self
-            .connection_pool
-            .access_storage_tagged("api")
-            .await
-            .unwrap()
+        let mut connection = self.state.connection_pool.connection_tagged("api").await?;
+        let call_trace = connection
             .transactions_dal()
             .get_call_trace(tx_hash)
-            .await;
-        call_trace.map(|call_trace| {
+            .await
+            .context("get_call_trace")?;
+        Ok(call_trace.map(|call_trace| {
             let mut result: DebugCall = call_trace.into();
             if only_top_call {
                 result.calls = vec![];
             }
             result
-        })
+        }))
     }
 
     #[tracing::instrument(skip(self, request, block_id))]
@@ -129,30 +132,35 @@ impl DebugNamespace {
         block_id: Option<BlockId>,
         options: Option<TracerConfig>,
     ) -> Result<DebugCall, Web3Error> {
-        const METHOD_NAME: &str = "debug_trace_call";
-
         let block_id = block_id.unwrap_or(BlockId::Number(BlockNumber::Pending));
-        let method_latency = API_METRICS.start_block_call(METHOD_NAME, block_id);
+        self.current_method().set_block_id(block_id);
+
         let only_top_call = options
             .map(|options| options.tracer_config.only_top_call)
             .unwrap_or(false);
 
-        let mut connection = self
-            .connection_pool
-            .access_storage_tagged("api")
-            .await
-            .unwrap();
-        let block_args = BlockArgs::new(&mut connection, block_id)
-            .await
-            .map_err(|err| internal_error("debug_trace_call", err))?
-            .ok_or(Web3Error::NoBlock)?;
+        let mut connection = self.state.connection_pool.connection_tagged("api").await?;
+        let block_args = self
+            .state
+            .resolve_block_args(&mut connection, block_id)
+            .await?;
         drop(connection);
 
-        let tx = L2Tx::from_request(request.into(), USED_BOOTLOADER_MEMORY_BYTES)?;
+        self.current_method().set_block_diff(
+            self.state
+                .last_sealed_miniblock
+                .diff_with_block_args(&block_args),
+        );
+        let tx = L2Tx::from_request(request.into(), MAX_ENCODED_TX_SIZE)?;
 
         let shared_args = self.shared_args();
-        let vm_permit = self.vm_concurrency_limiter.acquire().await;
-        let vm_permit = vm_permit.ok_or(Web3Error::InternalError)?;
+        let vm_permit = self
+            .state
+            .tx_sender
+            .vm_concurrency_limiter()
+            .acquire()
+            .await;
+        let vm_permit = vm_permit.context("cannot acquire VM permit")?;
 
         // We don't need properly trace if we only need top call
         let call_tracer_result = Arc::new(OnceCell::default());
@@ -162,16 +170,18 @@ impl DebugNamespace {
             vec![ApiTracer::CallTracer(call_tracer_result.clone())]
         };
 
-        let result = execute_tx_eth_call(
-            vm_permit,
-            shared_args,
-            self.connection_pool.clone(),
-            tx.clone(),
-            block_args,
-            self.vm_execution_cache_misses_limit,
-            custom_tracers,
-        )
-        .await;
+        let executor = &self.state.tx_sender.0.executor;
+        let result = executor
+            .execute_tx_eth_call(
+                vm_permit,
+                shared_args,
+                self.state.connection_pool.clone(),
+                tx.clone(),
+                block_args,
+                self.sender_config().vm_execution_cache_misses_limit,
+                custom_tracers,
+            )
+            .await?;
 
         let (output, revert_reason) = match result.result {
             ExecutionResult::Success { output, .. } => (output, None),
@@ -198,21 +208,18 @@ impl DebugNamespace {
             revert_reason,
             trace,
         );
-
-        let block_diff = self.last_sealed_miniblock.diff_with_block_args(&block_args);
-        method_latency.observe(block_diff);
         Ok(call.into())
     }
 
     fn shared_args(&self) -> TxSharedArgs {
+        let sender_config = self.sender_config();
         TxSharedArgs {
             operator_account: AccountTreeId::default(),
-            l1_gas_price: 100_000,
-            fair_l2_gas_price: self.fair_l2_gas_price,
+            fee_input: self.batch_fee_input,
             base_system_contracts: self.api_contracts.eth_call.clone(),
-            caches: self.storage_caches.clone(),
+            caches: self.state.tx_sender.storage_caches().clone(),
             validation_computational_gas_limit: BLOCK_GAS_LIMIT,
-            chain_id: self.chain_id,
+            chain_id: sender_config.chain_id,
         }
     }
 }

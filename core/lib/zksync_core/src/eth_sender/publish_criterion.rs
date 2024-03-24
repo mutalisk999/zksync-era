@@ -1,11 +1,12 @@
-use async_trait::async_trait;
-use chrono::Utc;
-
 use std::fmt;
 
-use zksync_dal::StorageProcessor;
+use async_trait::async_trait;
+use chrono::Utc;
+use zksync_dal::{Connection, Core, CoreDal};
+use zksync_l1_contract_interface::{i_executor::structures::CommitBatchInfo, Tokenizable};
 use zksync_types::{
-    aggregated_operations::AggregatedActionType, commitment::L1BatchWithMetadata, L1BatchNumber,
+    aggregated_operations::AggregatedActionType, commitment::L1BatchWithMetadata, ethabi,
+    pubdata_da::PubdataDA, L1BatchNumber,
 };
 
 use super::metrics::METRICS;
@@ -20,7 +21,7 @@ pub trait L1BatchPublishCriterion: fmt::Debug + Send + Sync {
     /// Otherwise, returns the number of the last L1 batch that needs to be published.
     async fn last_l1_batch_to_publish(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         consecutive_l1_batches: &[L1BatchWithMetadata],
         last_sealed_l1_batch: L1BatchNumber,
     ) -> Option<L1BatchNumber>;
@@ -41,7 +42,7 @@ impl L1BatchPublishCriterion for NumberCriterion {
 
     async fn last_l1_batch_to_publish(
         &mut self,
-        _storage: &mut StorageProcessor<'_>,
+        _storage: &mut Connection<'_, Core>,
         consecutive_l1_batches: &[L1BatchWithMetadata],
         _last_sealed_l1_batch: L1BatchNumber,
     ) -> Option<L1BatchNumber> {
@@ -87,7 +88,7 @@ impl L1BatchPublishCriterion for TimestampDeadlineCriterion {
 
     async fn last_l1_batch_to_publish(
         &mut self,
-        _storage: &mut StorageProcessor<'_>,
+        _storage: &mut Connection<'_, Core>,
         consecutive_l1_batches: &[L1BatchWithMetadata],
         last_sealed_l1_batch: L1BatchNumber,
     ) -> Option<L1BatchNumber> {
@@ -132,7 +133,7 @@ impl GasCriterion {
 
     async fn get_gas_amount(
         &self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         batch_number: L1BatchNumber,
     ) -> u32 {
         storage
@@ -151,7 +152,7 @@ impl L1BatchPublishCriterion for GasCriterion {
 
     async fn last_l1_batch_to_publish(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         consecutive_l1_batches: &[L1BatchWithMetadata],
         _last_sealed_l1_batch: L1BatchNumber,
     ) -> Option<L1BatchNumber> {
@@ -198,6 +199,7 @@ impl L1BatchPublishCriterion for GasCriterion {
 pub struct DataSizeCriterion {
     pub op: AggregatedActionType,
     pub data_limit: usize,
+    pub pubdata_da: PubdataDA,
 }
 
 #[async_trait]
@@ -208,7 +210,7 @@ impl L1BatchPublishCriterion for DataSizeCriterion {
 
     async fn last_l1_batch_to_publish(
         &mut self,
-        _storage: &mut StorageProcessor<'_>,
+        _storage: &mut Connection<'_, Core>,
         consecutive_l1_batches: &[L1BatchWithMetadata],
         _last_sealed_l1_batch: L1BatchNumber,
     ) -> Option<L1BatchNumber> {
@@ -216,13 +218,19 @@ impl L1BatchPublishCriterion for DataSizeCriterion {
         let mut data_size_left = self.data_limit - STORED_BLOCK_INFO_SIZE;
 
         for (index, l1_batch) in consecutive_l1_batches.iter().enumerate() {
-            if data_size_left < l1_batch.l1_commit_data_size() {
+            // TODO (PLA-771): Make sure that this estimation is correct.
+            let l1_commit_data_size =
+                ethabi::encode(&[ethabi::Token::Array(vec![CommitBatchInfo::new(
+                    l1_batch,
+                    self.pubdata_da,
+                )
+                .into_token()])])
+                .len();
+            if data_size_left < l1_commit_data_size {
                 if index == 0 {
                     panic!(
                         "L1 batch #{} requires {} data, which is more than the range limit of {}",
-                        l1_batch.header.number,
-                        l1_batch.l1_commit_data_size(),
-                        self.data_limit
+                        l1_batch.header.number, l1_commit_data_size, self.data_limit
                     );
                 }
 
@@ -237,7 +245,7 @@ impl L1BatchPublishCriterion for DataSizeCriterion {
                 METRICS.block_aggregation_reason[&(self.op, "data_size").into()].inc();
                 return Some(output);
             }
-            data_size_left -= l1_batch.l1_commit_data_size();
+            data_size_left -= l1_commit_data_size;
         }
 
         None

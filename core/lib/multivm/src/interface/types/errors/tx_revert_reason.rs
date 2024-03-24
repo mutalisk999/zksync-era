@@ -1,8 +1,6 @@
-use super::halt::Halt;
-
 use std::fmt::Display;
 
-use super::{BootloaderErrorCode, VmRevertReason};
+use super::{halt::Halt, BootloaderErrorCode, VmRevertReason};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TxRevertReason {
@@ -57,7 +55,7 @@ impl TxRevertReason {
             BootloaderErrorCode::UnacceptablePubdataPrice => {
                 Self::Halt(Halt::UnexpectedVMBehavior("UnacceptablePubdataPrice".to_owned()))
             }
-            // This is different from AccountTxValidationFailed error in a way that it means that
+            // This is different from `AccountTxValidationFailed` error in a way that it means that
             // the error was not produced by the account itself, but for some other unknown reason (most likely not enough gas)
             BootloaderErrorCode::TxValidationError => Self::Halt(Halt::ValidationFailed(revert_reason)),
             // Note, that `InnerTxError` is derived only after the actual tx execution, so
@@ -109,6 +107,15 @@ impl TxRevertReason {
             BootloaderErrorCode::PaymasterReturnedInvalidMagic => {
                 Self::Halt(Halt::ValidationFailed(VmRevertReason::General { msg: String::from("Paymaster validation returned invalid magic value. Please refer to the documentation of the paymaster for more details"), data: vec![] }))
             }
+            BootloaderErrorCode::L1MessengerLogSendingFailed => {
+                Self::Halt(Halt::UnexpectedVMBehavior(format!("Failed to send log via L1Messenger for: {}", revert_reason)))
+            },
+            BootloaderErrorCode::L1MessengerPublishingFailed => {
+                Self::Halt(Halt::UnexpectedVMBehavior(format!("Failed to publish pubdata via L1Messenger for: {}", revert_reason)))
+            },
+            BootloaderErrorCode::FailedToCallSystemContext => {
+                Self::Halt(Halt::UnexpectedVMBehavior(format!("Failed to call system context contract: {}", revert_reason)))
+            },
             BootloaderErrorCode::Unknown => Self::Halt(Halt::UnexpectedVMBehavior(format!(
                 "Unsupported error code: {}. Revert reason: {}",
                 error_code[0], revert_reason
@@ -121,8 +128,8 @@ impl TxRevertReason {
                 Self::Halt(Halt::FailedToSetL2Block(format!("{}", revert_reason)))
 
             }
-            BootloaderErrorCode::FailedToPublishBlockDataToL1 => {
-                Self::Halt(Halt::UnexpectedVMBehavior(format!("Failed to publish block data to L1: {}", revert_reason)))
+            BootloaderErrorCode::FailedToPublishTimestampDataToL1 => {
+                Self::Halt(Halt::UnexpectedVMBehavior(format!("Failed to publish timestamp data to L1: {}", revert_reason)))
             }
         }
     }

@@ -1,27 +1,28 @@
 use async_trait::async_trait;
+use prover_dal::{Prover, ProverDal};
 use zksync_dal::ConnectionPool;
-use zksync_types::proofs::JobCountStatistics;
+use zksync_types::prover_dal::JobCountStatistics;
 
-use zksync_prover_utils::periodic_job::PeriodicJob;
+use crate::house_keeper::periodic_job::PeriodicJob;
 
 const PROOF_COMPRESSOR_SERVICE_NAME: &str = "proof_compressor";
 
 #[derive(Debug)]
 pub struct FriProofCompressorStatsReporter {
     reporting_interval_ms: u64,
-    pool: ConnectionPool,
+    pool: ConnectionPool<Prover>,
 }
 
 impl FriProofCompressorStatsReporter {
-    pub fn new(reporting_interval_ms: u64, pool: ConnectionPool) -> Self {
+    pub fn new(reporting_interval_ms: u64, pool: ConnectionPool<Prover>) -> Self {
         Self {
             reporting_interval_ms,
             pool,
         }
     }
 
-    async fn get_job_statistics(pool: &ConnectionPool) -> JobCountStatistics {
-        pool.access_storage()
+    async fn get_job_statistics(pool: &ConnectionPool<Prover>) -> JobCountStatistics {
+        pool.connection()
             .await
             .unwrap()
             .fri_proof_compressor_dal()
@@ -58,6 +59,26 @@ impl PeriodicJob for FriProofCompressorStatsReporter {
             stats.in_progress as f64,
             "type" => "in_progress"
         );
+
+        let oldest_not_compressed_batch = self
+            .pool
+            .connection()
+            .await
+            .unwrap()
+            .fri_proof_compressor_dal()
+            .get_oldest_not_compressed_batch()
+            .await;
+
+        if let Some(l1_batch_number) = oldest_not_compressed_batch {
+            metrics::gauge!(
+                format!(
+                    "prover_fri.{}.oldest_not_compressed_batch",
+                    PROOF_COMPRESSOR_SERVICE_NAME
+                ),
+                l1_batch_number.0 as f64
+            );
+        }
+
         Ok(())
     }
 

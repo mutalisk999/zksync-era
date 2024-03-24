@@ -1,30 +1,32 @@
+use std::{sync::Arc, time::Duration};
+
 use anyhow::Context as _;
 use tokio::sync::watch;
-
-use std::sync::Arc;
-use std::time::Duration;
-
 use zksync_config::configs::eth_sender::SenderConfig;
-use zksync_dal::{ConnectionPool, StorageProcessor};
+use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_eth_client::{
-    types::{Error, ExecutedTxStatus, SignedCallResult},
-    BoundEthInterface,
+    encode_blob_tx_with_sidecar, BoundEthInterface, Error, EthInterface, ExecutedTxStatus, Options,
+    RawTransactionBytes, SignedCallResult,
 };
 use zksync_types::{
-    eth_sender::EthTx,
-    web3::{contract::Options, error::Error as Web3Error},
-    L1BlockNumber, Nonce, H256, U256,
+    aggregated_operations::AggregatedActionType,
+    eth_sender::{EthTx, EthTxBlobSidecar},
+    web3::{
+        error::Error as Web3Error,
+        types::{BlockId, BlockNumber},
+    },
+    Address, L1BlockNumber, Nonce, EIP_1559_TX_TYPE, EIP_4844_TX_TYPE, H256, U256,
 };
 use zksync_utils::time::seconds_since_epoch;
 
 use super::{metrics::METRICS, ETHSenderError};
-use crate::l1_gas_price::L1TxParamsProvider;
-use crate::metrics::BlockL1Stage;
+use crate::{l1_gas_price::L1TxParamsProvider, metrics::BlockL1Stage};
 
 #[derive(Debug)]
 struct EthFee {
     base_fee_per_gas: u64,
     priority_fee_per_gas: u64,
+    blob_base_fee_per_gas: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,32 +39,42 @@ struct OperatorNonce {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct L1BlockNumbers {
+    pub safe: L1BlockNumber,
     pub finalized: L1BlockNumber,
     pub latest: L1BlockNumber,
 }
 
 /// The component is responsible for managing sending eth_txs attempts:
 /// Based on eth_tx queue the component generates new attempt with the minimum possible fee,
-/// save it to the database, and send it to ethereum.
+/// save it to the database, and send it to Ethereum.
 /// Based on eth_tx_history queue the component can mark txs as stuck and create the new attempt
 /// with higher gas price
 #[derive(Debug)]
-pub struct EthTxManager<E, G> {
-    ethereum_gateway: E,
+pub struct EthTxManager {
+    /// A gateway through which the operator normally sends all its transactions.
+    ethereum_gateway: Arc<dyn BoundEthInterface>,
+    /// If the operator is in 4844 mode this is sent to `Some` and used to send
+    /// commit transactions.
+    ethereum_gateway_blobs: Option<Arc<dyn BoundEthInterface>>,
     config: SenderConfig,
-    gas_adjuster: Arc<G>,
+    gas_adjuster: Arc<dyn L1TxParamsProvider>,
+    pool: ConnectionPool<Core>,
 }
 
-impl<E, G> EthTxManager<E, G>
-where
-    E: BoundEthInterface + Sync,
-    G: L1TxParamsProvider,
-{
-    pub fn new(config: SenderConfig, gas_adjuster: Arc<G>, ethereum_gateway: E) -> Self {
+impl EthTxManager {
+    pub fn new(
+        pool: ConnectionPool<Core>,
+        config: SenderConfig,
+        gas_adjuster: Arc<dyn L1TxParamsProvider>,
+        ethereum_gateway: Arc<dyn BoundEthInterface>,
+        ethereum_gateway_blobs: Option<Arc<dyn BoundEthInterface>>,
+    ) -> Self {
         Self {
             ethereum_gateway,
+            ethereum_gateway_blobs,
             config,
             gas_adjuster,
+            pool,
         }
     }
 
@@ -78,7 +90,7 @@ where
 
     async fn check_all_sending_attempts(
         &self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         op: &EthTx,
     ) -> Option<ExecutedTxStatus> {
         // Checking history items, starting from most recently sent.
@@ -86,6 +98,7 @@ where
             .eth_sender_dal()
             .get_tx_history_to_check(op.id)
             .await
+            .unwrap()
         {
             // `status` is a Result here and we don't unwrap it with `?`
             // because if we do and get an `Err`, we won't finish the for loop,
@@ -105,10 +118,45 @@ where
 
     async fn calculate_fee(
         &self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         tx: &EthTx,
         time_in_mempool: u32,
     ) -> Result<EthFee, ETHSenderError> {
+        let base_fee_per_gas = self.gas_adjuster.get_base_fee(0);
+        let priority_fee_per_gas = self.gas_adjuster.get_priority_fee();
+        let blob_base_fee_per_gas = Some(self.gas_adjuster.get_blob_base_fee());
+
+        if tx.blob_sidecar.is_some() {
+            if time_in_mempool != 0 {
+                // for blob transactions on re-sending need to double all gas prices
+                let previous_sent_tx = storage
+                    .eth_sender_dal()
+                    .get_last_sent_eth_tx(tx.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                return Ok(EthFee {
+                    base_fee_per_gas: std::cmp::max(
+                        previous_sent_tx.base_fee_per_gas * 2,
+                        base_fee_per_gas,
+                    ),
+                    priority_fee_per_gas: std::cmp::max(
+                        previous_sent_tx.priority_fee_per_gas * 2,
+                        priority_fee_per_gas,
+                    ),
+                    blob_base_fee_per_gas: std::cmp::max(
+                        previous_sent_tx.blob_base_fee_per_gas.map(|v| v * 2),
+                        blob_base_fee_per_gas,
+                    ),
+                });
+            }
+            return Ok(EthFee {
+                base_fee_per_gas,
+                priority_fee_per_gas,
+                blob_base_fee_per_gas,
+            });
+        }
+
         let base_fee_per_gas = self.gas_adjuster.get_base_fee(time_in_mempool);
 
         let priority_fee_per_gas = if time_in_mempool != 0 {
@@ -138,13 +186,14 @@ where
 
         Ok(EthFee {
             base_fee_per_gas,
+            blob_base_fee_per_gas: None,
             priority_fee_per_gas,
         })
     }
 
     async fn increase_priority_fee(
         &self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         eth_tx_id: u32,
         base_fee_per_gas: u64,
     ) -> Result<u64, ETHSenderError> {
@@ -152,6 +201,7 @@ where
             .eth_sender_dal()
             .get_last_sent_eth_tx(eth_tx_id)
             .await
+            .unwrap()
             .unwrap();
 
         let previous_base_fee = previous_sent_tx.base_fee_per_gas;
@@ -172,14 +222,14 @@ where
             return Err(ETHSenderError::from(Error::from(Web3Error::Internal)));
         }
 
-        // Increase `priority_fee_per_gas` by at least 20% to prevent "replacement transaction underpriced" error.
+        // Increase `priority_fee_per_gas` by at least 20% to prevent "replacement transaction under-priced" error.
         Ok((previous_priority_fee + (previous_priority_fee / 5) + 1)
             .max(self.gas_adjuster.get_priority_fee()))
     }
 
     pub(crate) async fn send_eth_tx(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         tx: &EthTx,
         time_in_mempool: u32,
         current_block: L1BlockNumber,
@@ -187,6 +237,7 @@ where
         let EthFee {
             base_fee_per_gas,
             priority_fee_per_gas,
+            blob_base_fee_per_gas,
         } = self.calculate_fee(storage, tx, time_in_mempool).await?;
 
         METRICS.used_base_fee_per_gas.observe(base_fee_per_gas);
@@ -194,9 +245,26 @@ where
             .used_priority_fee_per_gas
             .observe(priority_fee_per_gas);
 
-        let signed_tx = self
-            .sign_tx(tx, base_fee_per_gas, priority_fee_per_gas)
+        let blob_gas_price = if tx.blob_sidecar.is_some() {
+            Some(
+                blob_base_fee_per_gas
+                    .expect("always ready to query blob gas price for blob transactions; qed")
+                    .into(),
+            )
+        } else {
+            None
+        };
+
+        let mut signed_tx = self
+            .sign_tx(tx, base_fee_per_gas, priority_fee_per_gas, blob_gas_price)
             .await;
+
+        if let Some(blob_sidecar) = &tx.blob_sidecar {
+            signed_tx.raw_tx = RawTransactionBytes::new_unchecked(encode_blob_tx_with_sidecar(
+                signed_tx.raw_tx.as_ref(),
+                blob_sidecar,
+            ));
+        }
 
         if let Some(tx_history_id) = storage
             .eth_sender_dal()
@@ -204,10 +272,12 @@ where
                 tx.id,
                 base_fee_per_gas,
                 priority_fee_per_gas,
+                blob_base_fee_per_gas,
                 signed_tx.hash,
-                signed_tx.raw_tx.clone(),
+                signed_tx.raw_tx.as_ref(),
             )
             .await
+            .unwrap()
         {
             if let Err(error) = self
                 .send_raw_transaction(storage, tx_history_id, signed_tx.raw_tx, current_block)
@@ -227,9 +297,9 @@ where
 
     async fn send_raw_transaction(
         &self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         tx_history_id: u32,
-        raw_tx: Vec<u8>,
+        raw_tx: RawTransactionBytes,
         current_block: L1BlockNumber,
     ) -> Result<H256, ETHSenderError> {
         match self.ethereum_gateway.send_raw_tx(raw_tx).await {
@@ -237,14 +307,16 @@ where
                 storage
                     .eth_sender_dal()
                     .set_sent_at_block(tx_history_id, current_block.0)
-                    .await;
+                    .await
+                    .unwrap();
                 Ok(tx_hash)
             }
             Err(error) => {
                 storage
                     .eth_sender_dal()
                     .remove_tx_history(tx_history_id)
-                    .await;
+                    .await
+                    .unwrap();
                 Err(error.into())
             }
         }
@@ -270,23 +342,60 @@ where
         Ok(OperatorNonce { finalized, latest })
     }
 
+    async fn get_blobs_operator_nonce(
+        &self,
+        block_numbers: L1BlockNumbers,
+    ) -> Result<Option<OperatorNonce>, ETHSenderError> {
+        match &self.ethereum_gateway_blobs {
+            None => Ok(None),
+            Some(gateway) => {
+                let finalized = gateway
+                    .nonce_at(block_numbers.finalized.0.into(), "eth_tx_manager")
+                    .await?
+                    .as_u32()
+                    .into();
+
+                let latest = gateway
+                    .nonce_at(block_numbers.latest.0.into(), "eth_tx_manager")
+                    .await?
+                    .as_u32()
+                    .into();
+                Ok(Some(OperatorNonce { finalized, latest }))
+            }
+        }
+    }
+
     async fn get_l1_block_numbers(&self) -> Result<L1BlockNumbers, ETHSenderError> {
-        let finalized = if let Some(confirmations) = self.config.wait_confirmations {
+        let (finalized, safe) = if let Some(confirmations) = self.config.wait_confirmations {
             let latest_block_number = self
                 .ethereum_gateway
                 .block_number("eth_tx_manager")
                 .await?
                 .as_u64();
-            (latest_block_number.saturating_sub(confirmations) as u32).into()
+
+            let finalized = (latest_block_number.saturating_sub(confirmations) as u32).into();
+            (finalized, finalized)
         } else {
-            self.ethereum_gateway
-                .block("finalized".to_string(), "eth_tx_manager")
+            let finalized = self
+                .ethereum_gateway
+                .block(BlockId::Number(BlockNumber::Finalized), "eth_tx_manager")
                 .await?
                 .expect("Finalized block must be present on L1")
                 .number
                 .expect("Finalized block must contain number")
                 .as_u32()
-                .into()
+                .into();
+
+            let safe = self
+                .ethereum_gateway
+                .block(BlockId::Number(BlockNumber::Safe), "eth_tx_manager")
+                .await?
+                .expect("Safe block must be present on L1")
+                .number
+                .expect("Safe block must contain number")
+                .as_u32()
+                .into();
+            (finalized, safe)
         };
 
         let latest = self
@@ -295,21 +404,62 @@ where
             .await?
             .as_u32()
             .into();
-        Ok(L1BlockNumbers { finalized, latest })
+
+        Ok(L1BlockNumbers {
+            finalized,
+            latest,
+            safe,
+        })
     }
 
-    // Monitors the inflight transactions, marks mined ones as confirmed,
+    // Monitors the in-flight transactions, marks mined ones as confirmed,
     // returns the one that has to be resent (if there is one).
     pub(super) async fn monitor_inflight_transactions(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         l1_block_numbers: L1BlockNumbers,
     ) -> Result<Option<(EthTx, u32)>, ETHSenderError> {
-        METRICS
-            .last_known_l1_block
-            .set(l1_block_numbers.latest.0.into());
+        METRICS.track_block_numbers(&l1_block_numbers);
         let operator_nonce = self.get_operator_nonce(l1_block_numbers).await?;
-        let inflight_txs = storage.eth_sender_dal().get_inflight_txs().await;
+        let blobs_operator_nonce = self.get_blobs_operator_nonce(l1_block_numbers).await?;
+        let blobs_operator_address = self
+            .ethereum_gateway_blobs
+            .as_ref()
+            .map(|s| s.sender_account());
+
+        if let Some(res) = self
+            .monitor_inflight_transactions_inner(storage, l1_block_numbers, operator_nonce, None)
+            .await?
+        {
+            return Ok(Some(res));
+        };
+
+        if let Some(blobs_operator_nonce) = blobs_operator_nonce {
+            // need to check if both nonce and address are `Some`
+            if blobs_operator_address.is_none() {
+                panic!("blobs_operator_address has to be set its nonce is known; qed");
+            }
+            Ok(self
+                .monitor_inflight_transactions_inner(
+                    storage,
+                    l1_block_numbers,
+                    blobs_operator_nonce,
+                    blobs_operator_address,
+                )
+                .await?)
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn monitor_inflight_transactions_inner(
+        &mut self,
+        storage: &mut Connection<'_, Core>,
+        l1_block_numbers: L1BlockNumbers,
+        operator_nonce: OperatorNonce,
+        operator_address: Option<Address>,
+    ) -> Result<Option<(EthTx, u32)>, ETHSenderError> {
+        let inflight_txs = storage.eth_sender_dal().get_inflight_txs().await.unwrap();
         METRICS.number_of_inflight_txs.set(inflight_txs.len());
 
         tracing::trace!(
@@ -325,16 +475,20 @@ where
         // Not confirmed transactions, ordered by nonce
         for tx in inflight_txs {
             tracing::trace!("Checking tx id: {}", tx.id,);
+            if tx.from_addr != operator_address {
+                continue;
+            }
 
             // If the `operator_nonce.latest` <= `tx.nonce`, this means
             // that `tx` is not mined and we should resend it.
-            // We only resend the first unmined transaction.
+            // We only resend the first un-mined transaction.
             if operator_nonce.latest <= tx.nonce {
                 // None means txs hasn't been sent yet
                 let first_sent_at_block = storage
                     .eth_sender_dal()
                     .get_block_number_on_first_sent_attempt(tx.id)
                     .await
+                    .unwrap()
                     .unwrap_or(l1_block_numbers.latest.0);
                 return Ok(Some((tx, first_sent_at_block)));
             }
@@ -361,9 +515,9 @@ where
                 }
                 None => {
                     // The nonce has increased but we did not find the receipt.
-                    // This is an error because such a big reorg may cause transactions that were
+                    // This is an error because such a big re-org may cause transactions that were
                     // previously recorded as confirmed to become pending again and we have to
-                    // make sure it's not the case - otherwise eth_sender may not work properly.
+                    // make sure it's not the case - otherwise `eth_sender` may not work properly.
                     tracing::error!(
                         "Possible block reorgs: finalized nonce increase detected, but no tx receipt found for tx {:?}",
                         &tx
@@ -379,8 +533,23 @@ where
         tx: &EthTx,
         base_fee_per_gas: u64,
         priority_fee_per_gas: u64,
+        blob_gas_price: Option<U256>,
     ) -> SignedCallResult {
-        self.ethereum_gateway
+        // Chose the signing gateway. Use a custom one in case
+        // the operator is in 4844 mode and the operation at hand is Commit.
+        // then the optional gateway is used to send this transaction from a
+        // custom sender account.
+        let signing_gateway = if let Some(blobs_gateway) = self.ethereum_gateway_blobs.as_ref() {
+            if tx.tx_type == AggregatedActionType::Commit {
+                blobs_gateway
+            } else {
+                &self.ethereum_gateway
+            }
+        } else {
+            &self.ethereum_gateway
+        };
+
+        signing_gateway
             .sign_prepared_tx_for_addr(
                 tx.raw_tx.clone(),
                 tx.contract_address,
@@ -390,6 +559,19 @@ where
                     opt.max_fee_per_gas = Some(U256::from(base_fee_per_gas + priority_fee_per_gas));
                     opt.max_priority_fee_per_gas = Some(U256::from(priority_fee_per_gas));
                     opt.nonce = Some(tx.nonce.0.into());
+                    opt.transaction_type = if tx.blob_sidecar.is_some() {
+                        opt.max_fee_per_blob_gas = blob_gas_price;
+                        Some(EIP_4844_TX_TYPE.into())
+                    } else {
+                        Some(EIP_1559_TX_TYPE.into())
+                    };
+                    opt.blob_versioned_hashes = tx.blob_sidecar.as_ref().map(|s| match s {
+                        EthTxBlobSidecar::EthTxBlobSidecarV1(s) => s
+                            .blobs
+                            .iter()
+                            .map(|blob| H256::from_slice(&blob.versioned_hash))
+                            .collect(),
+                    });
                 }),
                 "eth_tx_manager",
             )
@@ -399,12 +581,12 @@ where
 
     async fn send_unsent_txs(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         l1_block_numbers: L1BlockNumbers,
     ) {
-        for tx in storage.eth_sender_dal().get_unsent_txs().await {
+        for tx in storage.eth_sender_dal().get_unsent_txs().await.unwrap() {
             // Check already sent txs not marked as sent and mark them as sent.
-            // The common reason for this behaviour is that we sent tx and stop the server
+            // The common reason for this behavior is that we sent tx and stop the server
             // before updating the database
             let tx_status = self.get_tx_status(tx.tx_hash).await;
 
@@ -413,12 +595,14 @@ where
                 storage
                     .eth_sender_dal()
                     .set_sent_at_block(tx.id, tx_status.receipt.block_number.unwrap().as_u32())
-                    .await;
+                    .await
+                    .unwrap();
 
                 let eth_tx = storage
                     .eth_sender_dal()
                     .get_eth_tx(tx.eth_tx_id)
                     .await
+                    .unwrap()
                     .expect("Eth tx should exist");
 
                 self.apply_tx_status(storage, &eth_tx, tx_status, l1_block_numbers.finalized)
@@ -427,19 +611,19 @@ where
                 .send_raw_transaction(
                     storage,
                     tx.id,
-                    tx.signed_raw_tx.clone(),
+                    RawTransactionBytes::new_unchecked(tx.signed_raw_tx.clone()),
                     l1_block_numbers.latest,
                 )
                 .await
             {
-                tracing::warn!("Error {:?} in sending tx {:?}", error, &tx);
+                tracing::warn!("Error sending transaction {tx:?}: {error}");
             }
         }
     }
 
     async fn apply_tx_status(
         &self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         tx: &EthTx,
         tx_status: ExecutedTxStatus,
         finalized_block: L1BlockNumber,
@@ -462,14 +646,15 @@ where
 
     pub async fn fail_tx(
         &self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         tx: &EthTx,
         tx_status: ExecutedTxStatus,
     ) {
         storage
             .eth_sender_dal()
             .mark_failed_transaction(tx.id)
-            .await;
+            .await
+            .unwrap();
         let failure_reason = self
             .ethereum_gateway
             .failure_reason(tx_status.receipt.transaction_hash)
@@ -489,7 +674,7 @@ where
 
     pub async fn confirm_tx(
         &self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         tx: &EthTx,
         tx_status: ExecutedTxStatus,
     ) {
@@ -502,7 +687,8 @@ where
         storage
             .eth_sender_dal()
             .confirm_tx(tx_status.tx_hash, gas_used)
-            .await;
+            .await
+            .unwrap();
 
         METRICS
             .track_eth_tx_metrics(storage, BlockL1Stage::Mined, tx)
@@ -531,30 +717,28 @@ where
             .eth_sender_dal()
             .get_block_number_on_first_sent_attempt(tx.id)
             .await
+            .unwrap()
             .unwrap_or(0);
         let waited_blocks = tx_status.receipt.block_number.unwrap().as_u32() - sent_at_block;
         METRICS.l1_blocks_waited_in_mempool[&tx_type_label].observe(waited_blocks.into());
     }
 
-    pub async fn run(
-        mut self,
-        pool: ConnectionPool,
-        stop_receiver: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    pub async fn run(mut self, stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
+        let pool = self.pool.clone();
         {
             let l1_block_numbers = self
                 .get_l1_block_numbers()
                 .await
                 .context("get_l1_block_numbers()")?;
-            let mut storage = pool.access_storage_tagged("eth_sender").await.unwrap();
+            let mut storage = pool.connection_tagged("eth_sender").await.unwrap();
             self.send_unsent_txs(&mut storage, l1_block_numbers).await;
         }
 
-        // It's mandatory to set last_known_l1_block to zero, otherwise the first iteration
-        // will never check inflight txs status
+        // It's mandatory to set `last_known_l1_block` to zero, otherwise the first iteration
+        // will never check in-flight txs status
         let mut last_known_l1_block = L1BlockNumber(0);
         loop {
-            let mut storage = pool.access_storage_tagged("eth_sender").await.unwrap();
+            let mut storage = pool.connection_tagged("eth_sender").await.unwrap();
 
             if *stop_receiver.borrow() {
                 tracing::info!("Stop signal received, eth_tx_manager is shutting down");
@@ -577,10 +761,15 @@ where
 
     async fn send_new_eth_txs(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         current_block: L1BlockNumber,
     ) {
-        let number_inflight_txs = storage.eth_sender_dal().get_inflight_txs().await.len();
+        let number_inflight_txs = storage
+            .eth_sender_dal()
+            .get_inflight_txs()
+            .await
+            .unwrap()
+            .len();
         let number_of_available_slots_for_eth_txs = self
             .config
             .max_txs_in_flight
@@ -591,7 +780,8 @@ where
             let new_eth_tx = storage
                 .eth_sender_dal()
                 .get_new_eth_txs(number_of_available_slots_for_eth_txs)
-                .await;
+                .await
+                .unwrap();
 
             for tx in new_eth_tx {
                 let _ = self.send_eth_tx(storage, &tx, 0, current_block).await;
@@ -602,7 +792,7 @@ where
     #[tracing::instrument(skip(self, storage))]
     async fn loop_iteration(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         previous_block: L1BlockNumber,
     ) -> Result<L1BlockNumber, ETHSenderError> {
         let l1_block_numbers = self.get_l1_block_numbers().await?;

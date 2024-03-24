@@ -10,7 +10,7 @@ keywords = ["blockchain", "zksync"]
 categories = ["cryptography"]
 
 [dependencies]
-vise = { git = "https://github.com/matter-labs/vise.git", version = "0.1.0", rev = "dd05139b76ab0843443ab3ff730174942c825dae" }
+vise = { git = "https://github.com/matter-labs/vise.git", version = "0.1.0", rev = "1c9cc500e92cf9ea052b230e114a6f9cce4fb2c1" }
 zksync_dal = { path = "../dal" }
 zksync_types = { path = "../types" }
 zksync_utils = { path = "../utils" }
@@ -21,7 +21,10 @@ mini-moka = "0.10.0"
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 itertools = "0.10.3"
+chrono = "0.4.31"
 
 [dev-dependencies]
+assert_matches = "1.5.0"
 rand = "0.8.5"
 tempfile = "3.0.2"
+test-casing = "0.1.2"

@@ -1,24 +1,29 @@
-use multivm::interface::{L1BatchEnv, L2BlockEnv, SystemEnv, TxExecutionMode, VmExecutionMode};
-use multivm::vm_latest::{
-    constants::{BLOCK_GAS_LIMIT, BOOTLOADER_HEAP_PAGE},
-    BootloaderState, BoxedTracer, DynTracer, HistoryEnabled, HistoryMode, Vm,
-    VmExecutionStopReason, VmTracer, ZkSyncVmState,
+use std::{cell::RefCell, rc::Rc};
+
+use multivm::{
+    interface::{
+        dyn_tracers::vm_1_4_1::DynTracer, tracer::VmExecutionStopReason, L1BatchEnv, L2BlockEnv,
+        SystemEnv, TxExecutionMode, VmExecutionMode, VmInterface,
+    },
+    vm_latest::{
+        constants::{BLOCK_GAS_LIMIT, BOOTLOADER_HEAP_PAGE},
+        BootloaderState, HistoryEnabled, HistoryMode, SimpleMemory, ToTracerPointer, Vm, VmTracer,
+        ZkSyncVmState,
+    },
+    zk_evm_latest::aux_structures::Timestamp,
 };
 use once_cell::sync::Lazy;
-use std::cell::RefCell;
-use std::rc::Rc;
 use zksync_contracts::{
     load_sys_contract, read_bootloader_code, read_sys_contract_bytecode, read_zbin_bytecode,
     BaseSystemContracts, ContractLanguage, SystemContractCode,
 };
 use zksync_state::{InMemoryStorage, StorageView, WriteStorage};
-use zksync_types::block::legacy_miniblock_hash;
 use zksync_types::{
-    ethabi::Token, fee::Fee, l1::L1Tx, l2::L2Tx, utils::storage_key_for_eth_balance, AccountTreeId,
-    Address, Execute, L1BatchNumber, L1TxCommonData, L2ChainId, MiniblockNumber, Nonce,
-    ProtocolVersionId, StorageKey, Timestamp, Transaction, BOOTLOADER_ADDRESS, H256,
-    SYSTEM_CONTEXT_ADDRESS, SYSTEM_CONTEXT_GAS_PRICE_POSITION, SYSTEM_CONTEXT_TX_ORIGIN_POSITION,
-    U256, ZKPORTER_IS_AVAILABLE,
+    block::MiniblockHasher, ethabi::Token, fee::Fee, fee_model::BatchFeeInput, l1::L1Tx, l2::L2Tx,
+    utils::storage_key_for_eth_balance, AccountTreeId, Address, Execute, L1BatchNumber,
+    L1TxCommonData, L2ChainId, MiniblockNumber, Nonce, ProtocolVersionId, StorageKey, Transaction,
+    BOOTLOADER_ADDRESS, H256, SYSTEM_CONTEXT_ADDRESS, SYSTEM_CONTEXT_GAS_PRICE_POSITION,
+    SYSTEM_CONTEXT_TX_ORIGIN_POSITION, U256, ZKPORTER_IS_AVAILABLE,
 };
 use zksync_utils::{bytecode::hash_bytecode, bytes_to_be_words, u256_to_h256};
 
@@ -31,7 +36,7 @@ struct SpecialBootloaderTracer {
     output: Rc<RefCell<u32>>,
 }
 
-impl<S: WriteStorage, H: HistoryMode> DynTracer<S, H> for SpecialBootloaderTracer {}
+impl<S: WriteStorage, H: HistoryMode> DynTracer<S, SimpleMemory<H>> for SpecialBootloaderTracer {}
 
 impl<S: WriteStorage, H: HistoryMode> VmTracer<S, H> for SpecialBootloaderTracer {
     fn initialize_tracer(&mut self, state: &mut ZkSyncVmState<S, H>) {
@@ -159,8 +164,8 @@ pub(super) fn get_l1_txs(number_of_txs: usize) -> (Vec<Transaction>, Vec<Transac
 
 fn read_bootloader_test_code(test: &str) -> Vec<u8> {
     read_zbin_bytecode(format!(
-        "etc/system-contracts/bootloader/tests/artifacts/{}.yul/{}.yul.zbin",
-        test, test
+        "contracts/system-contracts/bootloader/tests/artifacts/{}.yul.zbin",
+        test
     ))
 }
 
@@ -169,14 +174,16 @@ fn default_l1_batch() -> L1BatchEnv {
         previous_batch_hash: None,
         number: L1BatchNumber(1),
         timestamp: 100,
-        l1_gas_price: 50_000_000_000,   // 50 gwei
-        fair_l2_gas_price: 250_000_000, // 0.25 gwei
+        fee_input: BatchFeeInput::l1_pegged(
+            50_000_000_000, // 50 gwei
+            250_000_000,    // 0.25 gwei
+        ),
         fee_account: Address::random(),
         enforced_base_fee: None,
         first_l2_block: L2BlockEnv {
             number: 1,
             timestamp: 100,
-            prev_block_hash: legacy_miniblock_hash(MiniblockNumber(0)),
+            prev_block_hash: MiniblockHasher::legacy_hash(MiniblockNumber(0)),
             max_virtual_blocks_to_create: 100,
         },
     }
@@ -247,14 +254,11 @@ pub(super) fn execute_internal_transfer_test() -> u32 {
     let tracer = SpecialBootloaderTracer {
         input,
         output: tracer_result.clone(),
-    };
-    let mut vm = Vm::new(
-        l1_batch,
-        system_env,
-        Rc::new(RefCell::new(storage_view)),
-        HistoryEnabled,
-    );
-    let result = vm.inspect(vec![tracer.into_boxed()], VmExecutionMode::Bootloader);
+    }
+    .into_tracer_pointer();
+    let mut vm: Vm<_, HistoryEnabled> =
+        Vm::new(l1_batch, system_env, Rc::new(RefCell::new(storage_view)));
+    let result = vm.inspect(tracer.into(), VmExecutionMode::Bootloader);
 
     assert!(!result.result.is_failed(), "The internal call has reverted");
     tracer_result.take()
@@ -307,12 +311,8 @@ pub(super) fn execute_user_txs_in_test_gas_vm(
         chain_id: L2ChainId::default(),
     };
 
-    let mut vm = Vm::new(
-        l1_batch,
-        system_env,
-        Rc::new(RefCell::new(storage_view)),
-        HistoryEnabled,
-    );
+    let mut vm: Vm<_, HistoryEnabled> =
+        Vm::new(l1_batch, system_env, Rc::new(RefCell::new(storage_view)));
 
     let mut total_gas_refunded = 0;
     for tx in txs {
@@ -323,7 +323,8 @@ pub(super) fn execute_user_txs_in_test_gas_vm(
         if !accept_failure {
             assert!(
                 !tx_execution_result.result.is_failed(),
-                "A transaction has failed"
+                "A transaction has failed: {:?}",
+                tx_execution_result.result
             );
         }
     }

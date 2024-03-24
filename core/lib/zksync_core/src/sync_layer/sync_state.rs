@@ -1,5 +1,9 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use async_trait::async_trait;
+use serde::Serialize;
+use zksync_concurrency::{ctx, sync};
+use zksync_health_check::{CheckHealth, Health, HealthStatus};
 use zksync_types::MiniblockNumber;
 
 use crate::metrics::EN_METRICS;
@@ -10,9 +14,13 @@ use crate::metrics::EN_METRICS;
 /// and `ExternalIO` (on latest sealed miniblock).
 ///
 /// This structure operates on miniblocks rather than L1 batches, since this is the default unit used in the web3 API.
-#[derive(Debug, Default, Clone)]
-pub struct SyncState {
-    inner: Arc<RwLock<SyncStateInner>>,
+#[derive(Debug, Clone)]
+pub struct SyncState(Arc<sync::watch::Sender<SyncStateInner>>);
+
+impl Default for SyncState {
+    fn default() -> Self {
+        Self(Arc::new(sync::watch::channel(SyncStateInner::default()).0))
+    }
 }
 
 /// A threshold constant intended to keep the sync status less flaky.
@@ -20,73 +28,89 @@ pub struct SyncState {
 const SYNC_MINIBLOCK_DELTA: u32 = 10;
 
 impl SyncState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub(crate) fn get_main_node_block(&self) -> MiniblockNumber {
-        self.inner
-            .read()
-            .unwrap()
-            .main_node_block
-            .unwrap_or_default()
+        self.0.borrow().main_node_block.unwrap_or_default()
     }
 
     pub(crate) fn get_local_block(&self) -> MiniblockNumber {
-        self.inner.read().unwrap().local_block.unwrap_or_default()
+        self.0.borrow().local_block.unwrap_or_default()
     }
 
-    pub(super) fn set_main_node_block(&self, block: MiniblockNumber) {
-        let mut inner = self.inner.write().unwrap();
-        if let Some(local_block) = inner.local_block {
-            if block.0 < local_block.0 {
-                // Probably it's fine -- will be checked by the reorg detector.
-                tracing::warn!(
-                    "main_node_block({}) is less than local_block({})",
-                    block,
-                    local_block
-                );
-            }
-        }
-        inner.main_node_block = Some(block);
-        self.update_sync_metric(&inner);
+    pub(crate) async fn wait_for_main_node_block(
+        &self,
+        ctx: &ctx::Ctx,
+        want: MiniblockNumber,
+    ) -> ctx::OrCanceled<()> {
+        sync::wait_for(
+            ctx,
+            &mut self.0.subscribe(),
+            |s| matches!(s.main_node_block, Some(got) if got >= want),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) fn set_main_node_block(&self, block: MiniblockNumber) {
+        self.0.send_modify(|inner| inner.set_main_node_block(block));
     }
 
     pub(super) fn set_local_block(&self, block: MiniblockNumber) {
-        let mut inner = self.inner.write().unwrap();
-        if let Some(main_node_block) = inner.main_node_block {
-            if block.0 > main_node_block.0 {
-                // Probably it's fine -- will be checked by the reorg detector.
-                tracing::warn!(
-                    "local_block({}) is greater than main_node_block({})",
-                    block,
-                    main_node_block
-                );
-            }
-        }
-        inner.local_block = Some(block);
-        self.update_sync_metric(&inner);
+        self.0.send_modify(|inner| inner.set_local_block(block));
     }
 
     pub(crate) fn is_synced(&self) -> bool {
-        let inner = self.inner.read().unwrap();
-        self.is_synced_inner(&inner).0
+        self.0.borrow().is_synced().0
     }
+}
 
-    fn update_sync_metric(&self, inner: &SyncStateInner) {
-        let (is_synced, lag) = self.is_synced_inner(inner);
-        EN_METRICS.synced.set(is_synced.into());
-        if let Some(lag) = lag {
-            EN_METRICS.sync_lag.set(lag.into());
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SyncStateInner {
+    pub(crate) main_node_block: Option<MiniblockNumber>,
+    pub(crate) local_block: Option<MiniblockNumber>,
+}
+
+impl SyncStateInner {
+    fn set_main_node_block(&mut self, block: MiniblockNumber) {
+        if let Some(local_block) = self.local_block {
+            if block < local_block {
+                // Probably it's fine -- will be checked by the re-org detector.
+                tracing::warn!("main_node_block({block}) is less than local_block({local_block})");
+            }
         }
+        self.main_node_block = Some(block);
+        self.update_sync_metric();
     }
 
-    fn is_synced_inner(&self, inner: &SyncStateInner) -> (bool, Option<u32>) {
-        if let (Some(main_node_block), Some(local_block)) =
-            (inner.main_node_block, inner.local_block)
+    fn set_local_block(&mut self, block: MiniblockNumber) {
+        if let Some(main_node_block) = self.main_node_block {
+            if block > main_node_block {
+                // Probably it's fine -- will be checked by the re-org detector.
+                tracing::warn!(
+                    "local_block({block}) is greater than main_node_block({main_node_block})"
+                );
+            }
+        }
+        self.local_block = Some(block);
+        self.update_sync_metric();
+    }
+}
+
+#[async_trait]
+impl CheckHealth for SyncState {
+    fn name(&self) -> &'static str {
+        "sync_state"
+    }
+
+    async fn check_health(&self) -> Health {
+        Health::from(&*self.0.borrow())
+    }
+}
+impl SyncStateInner {
+    fn is_synced(&self) -> (bool, Option<u32>) {
+        if let (Some(main_node_block), Some(local_block)) = (self.main_node_block, self.local_block)
         {
             let Some(block_diff) = main_node_block.0.checked_sub(local_block.0) else {
-                // We're ahead of the main node, this situation is handled by the reorg detector.
+                // We're ahead of the main node, this situation is handled by the re-org detector.
                 return (true, Some(0));
             };
             (block_diff <= SYNC_MINIBLOCK_DELTA, Some(block_diff))
@@ -94,33 +118,73 @@ impl SyncState {
             (false, None)
         }
     }
+
+    fn update_sync_metric(&self) {
+        let (is_synced, lag) = self.is_synced();
+        EN_METRICS.synced.set(is_synced.into());
+        if let Some(lag) = lag {
+            EN_METRICS.sync_lag.set(lag.into());
+        }
+    }
 }
 
-#[derive(Debug, Default)]
-struct SyncStateInner {
-    main_node_block: Option<MiniblockNumber>,
-    local_block: Option<MiniblockNumber>,
+impl From<&SyncStateInner> for Health {
+    fn from(state: &SyncStateInner) -> Health {
+        #[derive(Debug, Serialize)]
+        struct SyncStateHealthDetails {
+            is_synced: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            main_node_block: Option<MiniblockNumber>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            local_block: Option<MiniblockNumber>,
+        }
+
+        let (is_synced, block_diff) = state.is_synced();
+        let status = if is_synced {
+            HealthStatus::Ready
+        } else if block_diff.is_some() {
+            HealthStatus::Affected
+        } else {
+            return HealthStatus::NotReady.into(); // `state` isn't initialized yet
+        };
+        Health::from(status).with_details(SyncStateHealthDetails {
+            is_synced,
+            main_node_block: state.main_node_block,
+            local_block: state.local_block,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+
     use super::*;
 
-    #[test]
-    fn test_sync_state() {
-        let sync_state = SyncState::new();
+    #[tokio::test]
+    async fn test_sync_state() {
+        let sync_state = SyncState::default();
 
         // The node is not synced if there is no data.
         assert!(!sync_state.is_synced());
+
+        let health = sync_state.check_health().await;
+        assert_matches!(health.status(), HealthStatus::NotReady);
 
         // The gap is too big, still not synced.
         sync_state.set_local_block(MiniblockNumber(0));
         sync_state.set_main_node_block(MiniblockNumber(SYNC_MINIBLOCK_DELTA + 1));
         assert!(!sync_state.is_synced());
 
+        let health = sync_state.check_health().await;
+        assert_matches!(health.status(), HealthStatus::Affected);
+
         // Within the threshold, the node is synced.
         sync_state.set_local_block(MiniblockNumber(1));
         assert!(sync_state.is_synced());
+
+        let health = sync_state.check_health().await;
+        assert_matches!(health.status(), HealthStatus::Ready);
 
         // Can reach the main node last block.
         sync_state.set_local_block(MiniblockNumber(SYNC_MINIBLOCK_DELTA + 1));
@@ -133,11 +197,11 @@ mod tests {
 
     #[test]
     fn test_sync_state_doesnt_panic_on_local_block() {
-        let sync_state = SyncState::new();
+        let sync_state = SyncState::default();
 
         sync_state.set_main_node_block(MiniblockNumber(1));
         sync_state.set_local_block(MiniblockNumber(2));
-        // ^ should not panic, as we defer the situation to the reorg detector.
+        // ^ should not panic, as we defer the situation to the re-org detector.
 
         // At the same time, we should consider ourselves synced unless `ReorgDetector` tells us otherwise.
         assert!(sync_state.is_synced());
@@ -145,11 +209,11 @@ mod tests {
 
     #[test]
     fn test_sync_state_doesnt_panic_on_main_node_block() {
-        let sync_state = SyncState::new();
+        let sync_state = SyncState::default();
 
         sync_state.set_local_block(MiniblockNumber(2));
         sync_state.set_main_node_block(MiniblockNumber(1));
-        // ^ should not panic, as we defer the situation to the reorg detector.
+        // ^ should not panic, as we defer the situation to the re-org detector.
 
         // At the same time, we should consider ourselves synced unless `ReorgDetector` tells us otherwise.
         assert!(sync_state.is_synced());

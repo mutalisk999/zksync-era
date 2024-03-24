@@ -25,9 +25,9 @@ export async function server(rebuildTree: boolean, uring: boolean, components?: 
     await utils.spawn(`cargo run --bin zksync_server --release ${options}`);
 }
 
-export async function externalNode(reinit: boolean = false) {
+export async function externalNode(reinit: boolean = false, args: string[]) {
     if (process.env.ZKSYNC_ENV != 'ext-node') {
-        console.warn(`WARINING: using ${process.env.ZKSYNC_ENV} environment for external node`);
+        console.warn(`WARNING: using ${process.env.ZKSYNC_ENV} environment for external node`);
         console.warn('If this is a mistake, set $ZKSYNC_ENV to "ext-node" or other environment');
     }
 
@@ -41,18 +41,18 @@ export async function externalNode(reinit: boolean = false) {
     // On --reinit we want to reset RocksDB and Postgres before we start.
     if (reinit) {
         await utils.confirmAction();
-        await db.reset();
+        await db.reset({ server: true, prover: false });
         clean(path.dirname(process.env.EN_MERKLE_TREE_PATH!));
     }
 
-    await utils.spawn('cargo run --release --bin zksync_external_node');
+    await utils.spawn(`cargo run --release --bin zksync_external_node -- ${args.join(' ')}`);
 }
 
 async function create_genesis(cmd: string) {
     await utils.confirmAction();
     await utils.spawn(`${cmd} | tee genesis.log`);
     const genesisContents = fs.readFileSync('genesis.log').toString().split('\n');
-    const genesisBlockCommitment = genesisContents.find((line) => line.includes('CONTRACTS_GENESIS_BLOCK_COMMITMENT='));
+    const genesisBlockCommitment = genesisContents.find((line) => line.includes('CONTRACTS_GENESIS_BATCH_COMMITMENT='));
     const genesisBootloaderHash = genesisContents.find((line) => line.includes('CHAIN_STATE_KEEPER_BOOTLOADER_HASH='));
     const genesisDefaultAAHash = genesisContents.find((line) => line.includes('CHAIN_STATE_KEEPER_DEFAULT_AA_HASH='));
     const genesisRoot = genesisContents.find((line) => line.includes('CONTRACTS_GENESIS_ROOT='));
@@ -79,7 +79,7 @@ async function create_genesis(cmd: string) {
 
     if (
         genesisBlockCommitment == null ||
-        !/^CONTRACTS_GENESIS_BLOCK_COMMITMENT=0x[a-fA-F0-9]{64}$/.test(genesisBlockCommitment)
+        !/^CONTRACTS_GENESIS_BATCH_COMMITMENT=0x[a-fA-F0-9]{64}$/.test(genesisBlockCommitment)
     ) {
         throw Error(`Genesis is not needed (either Postgres DB or tree's Rocks DB is not empty)`);
     }
@@ -106,7 +106,7 @@ async function create_genesis(cmd: string) {
     env.modify('CONTRACTS_GENESIS_ROOT', genesisRoot);
     env.modify('CHAIN_STATE_KEEPER_BOOTLOADER_HASH', genesisBootloaderHash);
     env.modify('CHAIN_STATE_KEEPER_DEFAULT_AA_HASH', genesisDefaultAAHash);
-    env.modify('CONTRACTS_GENESIS_BLOCK_COMMITMENT', genesisBlockCommitment);
+    env.modify('CONTRACTS_GENESIS_BATCH_COMMITMENT', genesisBlockCommitment);
     env.modify('CONTRACTS_GENESIS_ROLLUP_LEAF_INDEX', genesisRollupLeafIndex);
 }
 
@@ -136,5 +136,5 @@ export const enCommand = new Command('external-node')
     .description('start zksync external node')
     .option('--reinit', 'reset postgres and rocksdb before starting')
     .action(async (cmd: Command) => {
-        await externalNode(cmd.reinit);
+        await externalNode(cmd.reinit, cmd.args);
     });

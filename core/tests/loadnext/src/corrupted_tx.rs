@@ -1,13 +1,13 @@
 use async_trait::async_trait;
-
 use zksync::signer::Signer;
-use zksync_eth_signer::{error::SignerError, EthereumSigner};
-use zksync_types::{Address, EIP712TypedStructure, Eip712Domain, PackedEthSignature, H256};
+use zksync_eth_signer::{
+    error::SignerError, raw_ethereum_tx::TransactionParameters, EthereumSigner,
+};
+use zksync_types::{
+    fee::Fee, l2::L2Tx, Address, EIP712TypedStructure, Eip712Domain, PackedEthSignature,
+};
 
 use crate::command::IncorrectnessModifier;
-use zksync_eth_signer::raw_ethereum_tx::TransactionParameters;
-use zksync_types::fee::Fee;
-use zksync_types::l2::L2Tx;
 
 /// Trait that exists solely to extend the signed zkSync transaction interface, providing the ability
 /// to modify transaction in a way that will make it invalid.
@@ -56,9 +56,7 @@ pub struct CorruptedSigner {
 
 impl CorruptedSigner {
     fn bad_signature() -> PackedEthSignature {
-        let private_key = H256::random();
-        let message = b"bad message";
-        PackedEthSignature::sign(&private_key, message).unwrap()
+        PackedEthSignature::default()
     }
 
     pub fn new(address: Address) -> Self {
@@ -68,10 +66,6 @@ impl CorruptedSigner {
 
 #[async_trait]
 impl EthereumSigner for CorruptedSigner {
-    async fn sign_message(&self, _message: &[u8]) -> Result<PackedEthSignature, SignerError> {
-        Ok(Self::bad_signature())
-    }
-
     async fn sign_typed_data<S: EIP712TypedStructure + Sync>(
         &self,
         _domain: &Eip712Domain,
@@ -94,13 +88,13 @@ impl EthereumSigner for CorruptedSigner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use zksync_eth_signer::PrivateKeySigner;
-    use zksync_types::fee::Fee;
-    use zksync_types::L2ChainId;
     use zksync_types::{
-        tokens::ETHEREUM_ADDRESS, tx::primitives::PackedEthSignature, Address, Nonce, H256,
+        fee::Fee, tokens::ETHEREUM_ADDRESS, tx::primitives::PackedEthSignature, Address, L2ChainId,
+        Nonce, H256,
     };
+
+    use super::*;
 
     const AMOUNT: u64 = 100;
     const FEE: u64 = 100;

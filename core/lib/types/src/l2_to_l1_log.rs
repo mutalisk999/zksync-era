@@ -1,8 +1,6 @@
-use crate::commitment::SerializeCommitment;
-use crate::{Address, H256};
 use serde::{Deserialize, Serialize};
-use zk_evm::reference_impls::event_sink::EventMessage;
-use zksync_utils::u256_to_h256;
+
+use crate::{commitment::SerializeCommitment, Address, ProtocolVersionId, H256};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, Eq)]
 pub struct L2ToL1Log {
@@ -14,12 +12,18 @@ pub struct L2ToL1Log {
     pub value: H256,
 }
 
-impl L2ToL1Log {
-    /// Legacy upper bound of L2-to-L1 logs per single L1 batch. This is not used as a limit now,
-    /// but still determines the minimum number of items in the Merkle tree built from L2-to-L1 logs
-    /// for a certain batch.
-    pub const LEGACY_LIMIT_PER_L1_BATCH: usize = 512;
+/// A struct representing a "user" L2->L1 log, i.e. the one that has been emitted by using the L1Messenger.
+/// It is identical to the SystemL2ToL1Log struct, but
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, Eq)]
+pub struct UserL2ToL1Log(pub L2ToL1Log);
 
+/// A struct representing a "user" L2->L1 log, i.e. the one that has been emitted by using the L1Messenger.
+/// It is identical to the SystemL2ToL1Log struct, but
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, Eq)]
+pub struct SystemL2ToL1Log(pub L2ToL1Log);
+
+impl L2ToL1Log {
     pub fn from_slice(data: &[u8]) -> Self {
         assert_eq!(data.len(), Self::SERIALIZED_SIZE);
         Self {
@@ -38,27 +42,42 @@ impl L2ToL1Log {
         self.serialize_commitment(&mut buffer);
         buffer
     }
+
+    pub fn packed_encoding(&self) -> Vec<u8> {
+        let mut res = vec![];
+        res.extend_from_slice(&self.shard_id.to_be_bytes());
+        res.extend_from_slice(&(self.is_service as u8).to_be_bytes());
+        res.extend_from_slice(&self.tx_number_in_block.to_be_bytes());
+        res.extend_from_slice(self.sender.as_bytes());
+        res.extend(self.key.as_bytes());
+        res.extend(self.value.as_bytes());
+        res
+    }
 }
 
-impl From<EventMessage> for L2ToL1Log {
-    fn from(m: EventMessage) -> Self {
-        Self {
-            shard_id: m.shard_id,
-            is_service: m.is_first,
-            tx_number_in_block: m.tx_number_in_block,
-            sender: m.address,
-            key: u256_to_h256(m.key),
-            value: u256_to_h256(m.value),
-        }
+/// Returns the number of items in the Merkle tree built from L2-to-L1 logs
+/// for a certain protocol version.
+pub fn l2_to_l1_logs_tree_size(protocol_version: ProtocolVersionId) -> usize {
+    pub const PRE_BOOJUM_L2_L1_LOGS_TREE_SIZE: usize = 512;
+    pub const VM_1_4_0_L2_L1_LOGS_TREE_SIZE: usize = 2048;
+    pub const VM_1_4_2_L2_L1_LOGS_TREE_SIZE: usize = 4096;
+
+    if protocol_version.is_pre_boojum() {
+        PRE_BOOJUM_L2_L1_LOGS_TREE_SIZE
+    } else if protocol_version.is_1_4_0() || protocol_version.is_1_4_1() {
+        VM_1_4_0_L2_L1_LOGS_TREE_SIZE
+    } else {
+        VM_1_4_2_L2_L1_LOGS_TREE_SIZE
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::L2ToL1Log;
     use zksync_basic_types::U256;
     use zksync_system_constants::L1_MESSENGER_ADDRESS;
     use zksync_utils::u256_to_h256;
+
+    use super::L2ToL1Log;
 
     #[test]
     fn l2_to_l1_log_to_bytes() {

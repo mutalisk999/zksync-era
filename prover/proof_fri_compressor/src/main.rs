@@ -1,21 +1,23 @@
+use std::{env, time::Duration};
+
 use anyhow::Context as _;
-use std::env;
-use structopt::StructOpt;
-use tokio::{sync::oneshot, sync::watch};
-
-use std::time::Duration;
-
 use prometheus_exporter::PrometheusExporterConfig;
-use zksync_config::configs::FriProofCompressorConfig;
-use zksync_dal::connection::DbVariant;
-use zksync_dal::ConnectionPool;
+use prover_dal::{ConnectionPool, Prover};
+use structopt::StructOpt;
+use tokio::sync::{oneshot, watch};
+use zksync_config::configs::{FriProofCompressorConfig, ObservabilityConfig, PostgresConfig};
+use zksync_env_config::{object_store::ProverObjectStoreConfig, FromEnv};
 use zksync_object_store::ObjectStoreFactory;
 use zksync_queued_job_processor::JobProcessor;
 use zksync_utils::wait_for_tasks::wait_for_tasks;
 
-use crate::compressor::ProofCompressor;
+use crate::{
+    compressor::ProofCompressor, initial_setup_keys::download_initial_setup_keys_if_not_present,
+};
 
 mod compressor;
+mod initial_setup_keys;
+mod metrics;
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -30,30 +32,32 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    #[allow(deprecated)] // TODO (QIT-21): Use centralized configuration approach.
-    let log_format = vlog::log_format_from_env();
-    #[allow(deprecated)] // TODO (QIT-21): Use centralized configuration approach.
-    let sentry_url = vlog::sentry_url_from_env();
-    #[allow(deprecated)] // TODO (QIT-21): Use centralized configuration approach.
-    let environment = vlog::environment_from_env();
+    let observability_config =
+        ObservabilityConfig::from_env().context("ObservabilityConfig::from_env()")?;
+    let log_format: vlog::LogFormat = observability_config
+        .log_format
+        .parse()
+        .context("Invalid log format")?;
 
     let mut builder = vlog::ObservabilityBuilder::new().with_log_format(log_format);
-    if let Some(sentry_url) = sentry_url {
+    if let Some(sentry_url) = &observability_config.sentry_url {
         builder = builder
-            .with_sentry_url(&sentry_url)
-            .context("Invalid Sentry URL")?
-            .with_sentry_environment(environment);
+            .with_sentry_url(sentry_url)
+            .expect("Invalid Sentry URL")
+            .with_sentry_environment(observability_config.sentry_environment);
     }
     let _guard = builder.build();
 
     let opt = Opt::from_args();
     let config = FriProofCompressorConfig::from_env().context("FriProofCompressorConfig")?;
-    let pool = ConnectionPool::builder(DbVariant::Prover)
+    let postgres_config = PostgresConfig::from_env().context("PostgresConfig::from_env()")?;
+    let pool = ConnectionPool::<Prover>::singleton(postgres_config.prover_url()?)
         .build()
         .await
         .context("failed to build a connection pool")?;
-    let blob_store = ObjectStoreFactory::prover_from_env()
-        .context("ObjectSToreFactor::prover_from_env()")?
+    let object_store_config =
+        ProverObjectStoreConfig::from_env().context("ProverObjectStoreConfig::from_env()")?;
+    let blob_store = ObjectStoreFactory::new(object_store_config.0)
         .create_store()
         .await;
     let proof_compressor = ProofCompressor::new(
@@ -61,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         pool,
         config.compression_mode,
         config.verify_wrapper_proof,
+        config.max_attempts,
     );
 
     let (stop_sender, stop_receiver) = watch::channel(false);
@@ -74,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     })
     .expect("Error setting Ctrl+C handler"); // Setting handler should always succeed.
 
-    zksync_prover_utils::ensure_initial_setup_keys_present(
+    download_initial_setup_keys_if_not_present(
         &config.universal_setup_path,
         &config.universal_setup_download_url,
     );

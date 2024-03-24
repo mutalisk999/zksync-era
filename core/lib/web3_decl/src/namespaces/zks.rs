@@ -1,19 +1,18 @@
 use std::collections::HashMap;
 
-use bigdecimal::BigDecimal;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-
 use zksync_types::{
     api::{
-        BlockDetails, BridgeAddresses, L1BatchDetails, L2ToL1LogProof, ProtocolVersion,
+        BlockDetails, BridgeAddresses, L1BatchDetails, L2ToL1LogProof, Proof, ProtocolVersion,
         TransactionDetails,
     },
     fee::Fee,
+    fee_model::FeeParams,
     transaction_request::CallRequest,
     Address, L1BatchNumber, MiniblockNumber, H256, U256, U64,
 };
 
-use crate::types::{Filter, Log, Token};
+use crate::types::Token;
 
 #[cfg_attr(
     all(feature = "client", feature = "server"),
@@ -34,6 +33,9 @@ pub trait ZksNamespace {
     #[method(name = "estimateGasL1ToL2")]
     async fn estimate_gas_l1_to_l2(&self, req: CallRequest) -> RpcResult<U256>;
 
+    #[method(name = "getBridgehubContract")]
+    async fn get_bridgehub_contract(&self) -> RpcResult<Option<Address>>;
+
     #[method(name = "getMainContract")]
     async fn get_main_contract(&self) -> RpcResult<Address>;
 
@@ -48,8 +50,6 @@ pub trait ZksNamespace {
 
     #[method(name = "getConfirmedTokens")]
     async fn get_confirmed_tokens(&self, from: u32, limit: u8) -> RpcResult<Vec<Token>>;
-    #[method(name = "getTokenPrice")]
-    async fn get_token_price(&self, token_address: Address) -> RpcResult<BigDecimal>;
 
     #[method(name = "getAllAccountBalances")]
     async fn get_all_account_balances(&self, address: Address)
@@ -102,12 +102,20 @@ pub trait ZksNamespace {
     #[method(name = "getL1GasPrice")]
     async fn get_l1_gas_price(&self) -> RpcResult<U64>;
 
+    #[method(name = "getFeeParams")]
+    async fn get_fee_params(&self) -> RpcResult<FeeParams>;
+
     #[method(name = "getProtocolVersion")]
     async fn get_protocol_version(
         &self,
         version_id: Option<u16>,
     ) -> RpcResult<Option<ProtocolVersion>>;
 
-    #[method(name = "getLogsWithVirtualBlocks")]
-    async fn get_logs_with_virtual_blocks(&self, filter: Filter) -> RpcResult<Vec<Log>>;
+    #[method(name = "getProof")]
+    async fn get_proof(
+        &self,
+        address: Address,
+        keys: Vec<H256>,
+        l1_batch_number: L1BatchNumber,
+    ) -> RpcResult<Option<Proof>>;
 }

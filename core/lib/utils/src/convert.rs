@@ -1,64 +1,22 @@
-use bigdecimal::BigDecimal;
-use num::{
-    bigint::ToBigInt,
-    rational::Ratio,
-    traits::{sign::Signed, Pow},
-    BigUint,
-};
 use std::convert::TryInto;
-use zksync_basic_types::{Address, H256, U128, U256};
+
+use bigdecimal::BigDecimal;
+use num::BigUint;
+use zksync_basic_types::{Address, H256, U256};
 
 pub fn u256_to_big_decimal(value: U256) -> BigDecimal {
-    let ratio = Ratio::new_raw(u256_to_biguint(value), BigUint::from(1u8));
-    ratio_to_big_decimal(&ratio, 80)
-}
-
-pub fn ratio_to_big_decimal(num: &Ratio<BigUint>, precision: usize) -> BigDecimal {
-    let bigint = round_precision_raw_no_div(num, precision)
-        .to_bigint()
-        .unwrap();
-    BigDecimal::new(bigint, precision as i64)
-}
-
-pub fn ratio_to_big_decimal_normalized(
-    num: &Ratio<BigUint>,
-    precision: usize,
-    min_precision: usize,
-) -> BigDecimal {
-    let normalized = ratio_to_big_decimal(num, precision).normalized();
-    let min_scaled = normalized.with_scale(min_precision as i64);
-    normalized.max(min_scaled)
-}
-
-pub fn big_decimal_to_ratio(num: &BigDecimal) -> Result<Ratio<BigUint>, anyhow::Error> {
-    let (big_int, exp) = num.as_bigint_and_exponent();
-    anyhow::ensure!(!big_int.is_negative(), "BigDecimal should be unsigned");
-    let big_uint = big_int.to_biguint().unwrap();
-    let ten_pow = BigUint::from(10_u32).pow(exp as u128);
-    Ok(Ratio::new(big_uint, ten_pow))
-}
-
-fn round_precision_raw_no_div(num: &Ratio<BigUint>, precision: usize) -> BigUint {
-    let ten_pow = BigUint::from(10u32).pow(precision);
-    (num * ten_pow).round().to_integer()
-}
-
-/// Converts `U256` into the corresponding `BigUint` value.
-pub fn u256_to_biguint(value: U256) -> BigUint {
-    let mut bytes = [0u8; 32];
-    value.to_little_endian(&mut bytes);
-    BigUint::from_bytes_le(&bytes)
-}
-
-/// Converts `U128` into the corresponding `BigUint` value.
-pub fn u128_to_biguint(value: U128) -> BigUint {
-    let mut bytes = [0u8; 16];
-    value.to_little_endian(&mut bytes);
-    BigUint::from_bytes_le(&bytes)
+    let mut u32_digits = vec![0_u32; 8];
+    // `u64_digit`s from `U256` are little-endian
+    for (i, &u64_digit) in value.0.iter().enumerate() {
+        u32_digits[2 * i] = u64_digit as u32;
+        u32_digits[2 * i + 1] = (u64_digit >> 32) as u32;
+    }
+    let value = BigUint::new(u32_digits);
+    BigDecimal::new(value.into(), 0)
 }
 
 /// Converts `BigUint` value into the corresponding `U256` value.
-pub fn biguint_to_u256(value: BigUint) -> U256 {
+fn biguint_to_u256(value: BigUint) -> U256 {
     let bytes = value.to_bytes_le();
     U256::from_little_endian(&bytes)
 }
@@ -99,13 +57,6 @@ pub fn bytes_to_chunks(bytes: &[u8]) -> Vec<[u8; 32]> {
             chunk.copy_from_slice(el);
             chunk
         })
-        .collect()
-}
-
-pub fn le_chunks_to_words(chunks: Vec<[u8; 32]>) -> Vec<U256> {
-    chunks
-        .into_iter()
-        .map(|el| U256::from_little_endian(&el))
         .collect()
 }
 
@@ -168,23 +119,10 @@ pub fn h256_to_u32(value: H256) -> u32 {
     u32::from_be_bytes(be_u32_bytes)
 }
 
-/// Converts u32 into the h256 as BE bytes
+/// Converts u32 into the H256 as BE bytes
 pub fn u32_to_h256(value: u32) -> H256 {
     let mut result = [0u8; 32];
     result[28..].copy_from_slice(&value.to_be_bytes());
-    H256(result)
-}
-
-/// Converts `h256` value as BE into the u64
-pub fn h256_to_u64(value: H256) -> u64 {
-    let be_u64_bytes: [u8; 8] = value[24..].try_into().unwrap();
-    u64::from_be_bytes(be_u64_bytes)
-}
-
-/// Converts u64 into the h256 as BE bytes
-pub fn u64_to_h256(value: u64) -> H256 {
-    let mut result = [0u8; 32];
-    result[24..].copy_from_slice(&value.to_be_bytes());
     H256(result)
 }
 
@@ -197,58 +135,41 @@ pub fn u256_to_bytes_be(value: &U256) -> Vec<u8> {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use num::BigInt;
-    use std::str::FromStr;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    use super::*;
 
     #[test]
-    fn test_ratio_to_big_decimal() {
-        let ratio = Ratio::from_integer(BigUint::from(0u32));
-        let dec = ratio_to_big_decimal(&ratio, 1);
-        assert_eq!(dec.to_string(), "0.0");
-        let ratio = Ratio::from_integer(BigUint::from(1234u32));
-        let dec = ratio_to_big_decimal(&ratio, 7);
-        assert_eq!(dec.to_string(), "1234.0000000");
-        // 4 divided by 9 is 0.(4).
-        let ratio = Ratio::new(BigUint::from(4u32), BigUint::from(9u32));
-        let dec = ratio_to_big_decimal(&ratio, 12);
-        assert_eq!(dec.to_string(), "0.444444444444");
-        // First 7 decimal digits of pi.
-        let ratio = Ratio::new(BigUint::from(52163u32), BigUint::from(16604u32));
-        let dec = ratio_to_big_decimal(&ratio, 6);
-        assert_eq!(dec.to_string(), "3.141592");
-    }
+    fn test_u256_to_bigdecimal() {
+        const RNG_SEED: u64 = 123;
 
-    #[test]
-    fn test_ratio_to_big_decimal_normalized() {
-        let ratio = Ratio::from_integer(BigUint::from(10u32));
-        let dec = ratio_to_big_decimal_normalized(&ratio, 100, 2);
-        assert_eq!(dec.to_string(), "10.00");
+        let mut rng = StdRng::seed_from_u64(RNG_SEED);
+        // Small values.
+        for _ in 0..10_000 {
+            let value: u64 = rng.gen();
+            let expected = BigDecimal::from(value);
+            assert_eq!(u256_to_big_decimal(value.into()), expected);
+        }
 
-        // First 7 decimal digits of pi.
-        let ratio = Ratio::new(BigUint::from(52163u32), BigUint::from(16604u32));
-        let dec = ratio_to_big_decimal_normalized(&ratio, 6, 2);
-        assert_eq!(dec.to_string(), "3.141592");
-
-        // 4 divided by 9 is 0.(4).
-        let ratio = Ratio::new(BigUint::from(4u32), BigUint::from(9u32));
-        let dec = ratio_to_big_decimal_normalized(&ratio, 12, 2);
-        assert_eq!(dec.to_string(), "0.444444444444");
-    }
-
-    #[test]
-    fn test_big_decimal_to_ratio() {
-        // Expect unsigned number.
-        let dec = BigDecimal::from(-1);
-        assert!(big_decimal_to_ratio(&dec).is_err());
-        let expected = Ratio::from_integer(BigUint::from(0u32));
-        let dec = BigDecimal::from(0);
-        let ratio = big_decimal_to_ratio(&dec).unwrap();
-        assert_eq!(ratio, expected);
-        let expected = Ratio::new(BigUint::from(1234567u32), BigUint::from(10000u32));
-        let dec = BigDecimal::from_str("123.4567").unwrap();
-        let ratio = big_decimal_to_ratio(&dec).unwrap();
-        assert_eq!(ratio, expected);
+        // Arbitrary values
+        for _ in 0..10_000 {
+            let u64_digits: [u64; 4] = rng.gen();
+            let value = u64_digits
+                .iter()
+                .enumerate()
+                .map(|(i, &digit)| U256::from(digit) << (i * 64))
+                .fold(U256::zero(), |acc, x| acc + x);
+            let expected_value = u64_digits
+                .iter()
+                .enumerate()
+                .map(|(i, &digit)| BigInt::from(digit) << (i * 64))
+                .fold(BigInt::from(0), |acc, x| acc + x);
+            assert_eq!(
+                u256_to_big_decimal(value),
+                BigDecimal::new(expected_value, 0)
+            );
+        }
     }
 
     #[test]

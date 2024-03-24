@@ -1,29 +1,28 @@
-use async_trait::async_trait;
-
 use std::{fmt, sync::Arc};
 
+use async_trait::async_trait;
 use zksync_config::{ContractsConfig, ETHClientConfig, ETHSenderConfig};
 use zksync_contracts::zksync_contract;
 use zksync_eth_signer::{raw_ethereum_tx::TransactionParameters, EthereumSigner, PrivateKeySigner};
-use zksync_types::web3::{
-    self,
-    contract::{
-        tokens::{Detokenize, Tokenize},
-        Options,
+use zksync_types::{
+    web3::{
+        self,
+        contract::tokens::Detokenize,
+        ethabi,
+        transports::Http,
+        types::{
+            Address, BlockId, BlockNumber, Filter, Log, Transaction, TransactionReceipt, H160,
+            H256, U256, U64,
+        },
     },
-    ethabi,
-    transports::Http,
-    types::{
-        Address, Block, BlockId, BlockNumber, Filter, Log, Transaction, TransactionReceipt, H160,
-        H256, U256, U64,
-    },
+    L1ChainId, PackedEthSignature, EIP_4844_TX_TYPE,
 };
-use zksync_types::{L1ChainId, PackedEthSignature, EIP_1559_TX_TYPE};
 
 use super::{query::QueryClient, Method, LATENCIES};
 use crate::{
-    types::{Error, ExecutedTxStatus, FailureInfo, SignedCallResult},
-    BoundEthInterface, EthInterface,
+    types::{encode_blob_tx_with_sidecar, Error, ExecutedTxStatus, FailureInfo, SignedCallResult},
+    Block, BoundEthInterface, CallFunctionArgs, ContractCall, EthInterface, Options,
+    RawTransactionBytes,
 };
 
 /// HTTP-based Ethereum client, backed by a private key to sign transactions.
@@ -37,17 +36,49 @@ impl PKSigningClient {
     ) -> Self {
         // Gather required data from the config.
         // It's done explicitly to simplify getting rid of this function later.
-        let main_node_url = &eth_client.web3_url;
         let operator_private_key = eth_sender
             .sender
             .private_key()
             .expect("Operator private key is required for signing client");
+
+        Self::from_config_inner(
+            eth_sender,
+            contracts_config,
+            eth_client,
+            operator_private_key,
+        )
+    }
+
+    /// Create an signing client for the blobs account
+    pub fn from_config_blobs(
+        eth_sender: &ETHSenderConfig,
+        contracts_config: &ContractsConfig,
+        eth_client: &ETHClientConfig,
+    ) -> Option<Self> {
+        // Gather required data from the config.
+        // It's done explicitly to simplify getting rid of this function later.
+        let operator_private_key = eth_sender.sender.private_key_blobs()?;
+
+        Some(Self::from_config_inner(
+            eth_sender,
+            contracts_config,
+            eth_client,
+            operator_private_key,
+        ))
+    }
+
+    fn from_config_inner(
+        eth_sender: &ETHSenderConfig,
+        contracts_config: &ContractsConfig,
+        eth_client: &ETHClientConfig,
+        operator_private_key: H256,
+    ) -> Self {
+        let main_node_url = &eth_client.web3_url;
         let diamond_proxy_addr = contracts_config.diamond_proxy_addr;
         let default_priority_fee_per_gas = eth_sender.gas_adjuster.default_priority_fee_per_gas;
         let l1_chain_id = eth_client.chain_id;
 
-        let transport =
-            web3::transports::Http::new(main_node_url).expect("Failed to create transport");
+        let transport = Http::new(main_node_url).expect("Failed to create transport");
         let operator_address = PackedEthSignature::address_from_private_key(&operator_private_key)
             .expect("Failed to get address from private key");
 
@@ -121,7 +152,7 @@ impl<S: EthereumSigner> EthInterface for SigningClient<S> {
         self.query_client.get_gas_price(component).await
     }
 
-    async fn send_raw_tx(&self, tx: Vec<u8>) -> Result<H256, Error> {
+    async fn send_raw_tx(&self, tx: RawTransactionBytes) -> Result<H256, Error> {
         self.query_client.send_raw_tx(tx).await
     }
 
@@ -165,34 +196,11 @@ impl<S: EthereumSigner> EthInterface for SigningClient<S> {
         self.query_client.get_tx(hash, component).await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn call_contract_function<R, A, B, P>(
+    async fn call_contract_function(
         &self,
-        func: &str,
-        params: P,
-        from: A,
-        options: Options,
-        block: B,
-        contract_address: Address,
-        contract_abi: ethabi::Contract,
-    ) -> Result<R, Error>
-    where
-        R: Detokenize + Unpin,
-        A: Into<Option<Address>> + Send,
-        B: Into<Option<BlockId>> + Send,
-        P: Tokenize + Send,
-    {
-        self.query_client
-            .call_contract_function(
-                func,
-                params,
-                from,
-                options,
-                block,
-                contract_address,
-                contract_abi,
-            )
-            .await
+        call: ContractCall,
+    ) -> Result<Vec<ethabi::Token>, Error> {
+        self.query_client.call_contract_function(call).await
     }
 
     async fn tx_receipt(
@@ -213,7 +221,7 @@ impl<S: EthereumSigner> EthInterface for SigningClient<S> {
 
     async fn block(
         &self,
-        block_id: String,
+        block_id: BlockId,
         component: &'static str,
     ) -> Result<Option<Block<H256>>, Error> {
         self.query_client.block(block_id, component).await
@@ -252,7 +260,16 @@ impl<S: EthereumSigner> BoundEthInterface for SigningClient<S> {
             None => self.inner.default_priority_fee_per_gas,
         };
 
-        // Fetch current base fee and add max_priority_fee_per_gas
+        if options.transaction_type == Some(EIP_4844_TX_TYPE.into()) {
+            if options.max_fee_per_blob_gas.is_none() {
+                return Err(Error::Eip4844MissingMaxFeePerBlobGas);
+            }
+            if options.blob_versioned_hashes.is_none() {
+                return Err(Error::Eip4844MissingBlobVersionedHashes);
+            }
+        }
+
+        // Fetch current base fee and add `max_priority_fee_per_gas`
         let max_fee_per_gas = match options.max_fee_per_gas {
             Some(max_fee_per_gas) => max_fee_per_gas,
             None => {
@@ -293,21 +310,28 @@ impl<S: EthereumSigner> BoundEthInterface for SigningClient<S> {
             chain_id: self.inner.chain_id.0,
             max_priority_fee_per_gas,
             gas_price: None,
-            transaction_type: Some(EIP_1559_TX_TYPE.into()),
+            transaction_type: options.transaction_type,
             access_list: None,
             max_fee_per_gas,
+            max_fee_per_blob_gas: options.max_fee_per_blob_gas,
+            blob_versioned_hashes: options.blob_versioned_hashes,
         };
 
-        let signed_tx = self.inner.eth_signer.sign_transaction(tx).await?;
+        let mut signed_tx = self.inner.eth_signer.sign_transaction(tx).await?;
         let hash = web3::signing::keccak256(&signed_tx).into();
         latency.observe();
-        Ok(SignedCallResult {
-            raw_tx: signed_tx,
+
+        if let Some(sidecar) = options.blob_tx_sidecar {
+            signed_tx = encode_blob_tx_with_sidecar(&signed_tx, &sidecar);
+        }
+
+        Ok(SignedCallResult::new(
+            RawTransactionBytes(signed_tx),
             max_priority_fee_per_gas,
             max_fee_per_gas,
             nonce,
             hash,
-        })
+        ))
     }
 
     async fn allowance_on_account(
@@ -317,19 +341,11 @@ impl<S: EthereumSigner> BoundEthInterface for SigningClient<S> {
         erc20_abi: ethabi::Contract,
     ) -> Result<U256, Error> {
         let latency = LATENCIES.direct[&Method::Allowance].start();
-        let res = self
-            .call_contract_function(
-                "allowance",
-                (self.inner.sender_account, address),
-                None,
-                Options::default(),
-                None,
-                token_address,
-                erc20_abi,
-            )
-            .await?;
+        let args = CallFunctionArgs::new("allowance", (self.inner.sender_account, address))
+            .for_contract(token_address, erc20_abi);
+        let res = self.call_contract_function(args).await?;
         latency.observe();
-        Ok(res)
+        Ok(U256::from_tokens(res)?)
     }
 }
 

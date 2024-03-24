@@ -19,13 +19,14 @@ RUN apt-get update && apt-get install -y \
     jq \
     openssh-server \
     openssh-client \
-    wget \
     vim \
     ca-certificates \
     gnupg2 \
     postgresql-client \
     wget \
-    bzip2
+    bzip2 \
+    unzip \
+    hub
 
 # Install dependencies for RocksDB. `liburing` is not available for Ubuntu 20.04,
 # so we use a PPA with the backport
@@ -35,10 +36,11 @@ RUN add-apt-repository ppa:savoury1/virtualisation && \
     curl \
     gnutls-bin git \
     build-essential \
-    clang-7 \
-    lldb-7 \
-    lld-7 \
-    liburing-dev
+    clang \
+    lldb \
+    lld \
+    liburing-dev \
+    libclang-dev
 
 # Install docker engine
 RUN wget -c -O - https://download.docker.com/linux/ubuntu/gpg | apt-key add -
@@ -48,10 +50,13 @@ RUN apt update; apt install -y docker-ce-cli
 # Configurate git to fetch submodules correctly (https://stackoverflow.com/questions/38378914/how-to-fix-git-error-rpc-failed-curl-56-gnutls)
 RUN git config --global http.postBuffer 1048576000
 
-# Install node and yarn
-RUN wget -c -O - https://deb.nodesource.com/setup_18.x | bash -
-RUN apt-get install -y nodejs
-RUN npm install -g yarn
+# Install Node and yarn
+ENV NODE_MAJOR=18
+RUN mkdir -p /etc/apt/keyrings && \
+    wget -c -O - https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && apt-get install nodejs -y && \
+    npm install -g yarn
 
 # Install Rust and required cargo packages
 ENV RUSTUP_HOME=/usr/local/rustup \
@@ -68,10 +73,9 @@ RUN echo "deb http://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/so
     gcloud config set metrics/environment github_docker_image
 
 RUN wget -c -O - https://sh.rustup.rs | bash -s -- -y
-RUN rustup install nightly-2023-07-21
+RUN rustup install nightly-2023-08-21
 RUN rustup default stable
-RUN cargo install --version=0.5.13 sqlx-cli
-RUN cargo install cargo-tarpaulin
+RUN cargo install --version=0.7.3 sqlx-cli
 RUN cargo install cargo-nextest
 
 # Copy compiler (both solc and zksolc) binaries

@@ -75,7 +75,7 @@ describe('Smart contract behavior checks', () => {
         const expensiveContract = await deployContract(alice, contracts.expensive, []);
 
         // First, check that the transaction that is too expensive would be rejected by the API server.
-        await expect(expensiveContract.expensive(2000)).toBeRejected();
+        await expect(expensiveContract.expensive(3000)).toBeRejected();
 
         // Second, check that processable transaction may fail with "out of gas" error.
         // To do so, we estimate gas for arg "1" and supply it to arg "20".
@@ -304,6 +304,30 @@ describe('Smart contract behavior checks', () => {
                 }
             })
         ).toBeAccepted([]);
+    });
+
+    test('Should reject tx with not enough gas for publishing bytecode', async () => {
+        // Send a transaction with big unique factory dep and provide gas enough for validation but not for bytecode publishing.
+        // Transaction should be rejected by API.
+
+        const BYTECODE_LEN = 50016;
+        const bytecode = ethers.utils.hexlify(ethers.utils.randomBytes(BYTECODE_LEN));
+
+        // Estimate gas for "no-op". It's a good estimate for validation gas.
+        const gasLimit = await alice.estimateGas({
+            to: alice.address,
+            data: '0x'
+        });
+
+        await expect(
+            alice.sendTransaction({
+                to: alice.address,
+                gasLimit,
+                customData: {
+                    factoryDeps: [bytecode]
+                }
+            })
+        ).toBeRejected('not enough gas to publish compressed bytecodes');
     });
 
     afterAll(async () => {

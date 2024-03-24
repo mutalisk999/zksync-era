@@ -1,29 +1,41 @@
-use zksync_types::{api::en::SyncBlock, MiniblockNumber};
+use anyhow::Context as _;
+use zksync_dal::CoreDal;
+use zksync_types::{api::en, tokens::TokenInfo, MiniblockNumber};
 use zksync_web3_decl::error::Web3Error;
 
-use crate::{
-    api_server::{web3::backend_jsonrpc::error::internal_error, web3::state::RpcState},
-    l1_gas_price::L1GasPriceProvider,
-};
+use crate::api_server::web3::{backend_jsonrpsee::MethodTracer, state::RpcState};
 
 /// Namespace for External Node unique methods.
 /// Main use case for it is the EN synchronization.
 #[derive(Debug)]
-pub struct EnNamespace<G> {
-    pub state: RpcState<G>,
+pub(crate) struct EnNamespace {
+    state: RpcState,
 }
 
-impl<G> Clone for EnNamespace<G> {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-        }
-    }
-}
-
-impl<G: L1GasPriceProvider> EnNamespace<G> {
-    pub fn new(state: RpcState<G>) -> Self {
+impl EnNamespace {
+    pub fn new(state: RpcState) -> Self {
         Self { state }
+    }
+
+    pub async fn consensus_genesis_impl(&self) -> Result<Option<en::ConsensusGenesis>, Web3Error> {
+        let Some(genesis) = self
+            .state
+            .connection_pool
+            .connection_tagged("api")
+            .await?
+            .consensus_dal()
+            .genesis()
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(en::ConsensusGenesis(
+            zksync_protobuf::serde::serialize(&genesis, serde_json::value::Serializer).unwrap(),
+        )))
+    }
+
+    pub(crate) fn current_method(&self) -> &MethodTracer {
+        &self.state.current_method
     }
 
     #[tracing::instrument(skip(self))]
@@ -31,21 +43,25 @@ impl<G: L1GasPriceProvider> EnNamespace<G> {
         &self,
         block_number: MiniblockNumber,
         include_transactions: bool,
-    ) -> Result<Option<SyncBlock>, Web3Error> {
-        let mut storage = self
-            .state
-            .connection_pool
-            .access_storage_tagged("api")
-            .await
-            .unwrap();
-        storage
+    ) -> Result<Option<en::SyncBlock>, Web3Error> {
+        let mut storage = self.state.connection_pool.connection_tagged("api").await?;
+        Ok(storage
             .sync_dal()
-            .sync_block(
-                block_number,
-                self.state.tx_sender.0.sender_config.fee_account_addr,
-                include_transactions,
-            )
+            .sync_block(block_number, include_transactions)
             .await
-            .map_err(|err| internal_error("en_syncL2Block", err))
+            .context("sync_block")?)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn sync_tokens_impl(
+        &self,
+        block_number: Option<MiniblockNumber>,
+    ) -> Result<Vec<TokenInfo>, Web3Error> {
+        let mut storage = self.state.connection_pool.connection_tagged("api").await?;
+        Ok(storage
+            .tokens_web3_dal()
+            .get_all_tokens(block_number)
+            .await
+            .context("get_all_tokens")?)
     }
 }

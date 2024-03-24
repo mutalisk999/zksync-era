@@ -1,20 +1,22 @@
 //! GCS-based [`ObjectStore`] implementation.
 
+use std::{fmt, future::Future, time::Duration};
+
 use async_trait::async_trait;
 use google_cloud_auth::{credentials::CredentialsFile, error::Error};
 use google_cloud_storage::{
     client::{Client, ClientConfig},
-    http::objects::{
-        delete::DeleteObjectRequest,
-        download::Range,
-        get::GetObjectRequest,
-        upload::{Media, UploadObjectRequest, UploadType},
+    http::{
+        objects::{
+            delete::DeleteObjectRequest,
+            download::Range,
+            get::GetObjectRequest,
+            upload::{Media, UploadObjectRequest, UploadType},
+        },
+        Error as HttpError,
     },
-    http::Error as HttpError,
 };
 use http::StatusCode;
-
-use std::{fmt, future::Future, time::Duration};
 
 use crate::{
     metrics::GCS_METRICS,
@@ -61,17 +63,22 @@ impl fmt::Debug for GoogleCloudStorage {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum GoogleCloudStorageAuthMode {
+    AuthenticatedWithCredentialFile(String),
+    Authenticated,
+    Anonymous,
+}
+
 impl GoogleCloudStorage {
     pub async fn new(
-        credential_file_path: Option<String>,
+        auth_mode: GoogleCloudStorageAuthMode,
         bucket_prefix: String,
         max_retries: u16,
     ) -> Self {
-        let client_config = retry(max_retries, || {
-            Self::get_client_config(credential_file_path.clone())
-        })
-        .await
-        .expect("failed fetching GCS client config after retries");
+        let client_config = retry(max_retries, || Self::get_client_config(auth_mode.clone()))
+            .await
+            .expect("failed fetching GCS client config after retries");
 
         Self {
             client: Client::new(client_config),
@@ -81,15 +88,17 @@ impl GoogleCloudStorage {
     }
 
     async fn get_client_config(
-        credential_file_path: Option<String>,
+        auth_mode: GoogleCloudStorageAuthMode,
     ) -> Result<ClientConfig, Error> {
-        if let Some(path) = credential_file_path {
-            let cred_file = CredentialsFile::new_from_file(path)
-                .await
-                .expect("failed loading GCS credential file");
-            ClientConfig::default().with_credentials(cred_file).await
-        } else {
-            ClientConfig::default().with_auth().await
+        match auth_mode {
+            GoogleCloudStorageAuthMode::AuthenticatedWithCredentialFile(path) => {
+                let cred_file = CredentialsFile::new_from_file(path)
+                    .await
+                    .expect("failed loading GCS credential file");
+                ClientConfig::default().with_credentials(cred_file).await
+            }
+            GoogleCloudStorageAuthMode::Authenticated => ClientConfig::default().with_auth().await,
+            GoogleCloudStorageAuthMode::Anonymous => Ok(ClientConfig::default().anonymous()),
         }
     }
 
@@ -97,7 +106,7 @@ impl GoogleCloudStorage {
         format!("{bucket}/{filename}")
     }
 
-    // For some bizzare reason, `async fn` doesn't work here, failing with the following error:
+    // For some bizarre reason, `async fn` doesn't work here, failing with the following error:
     //
     // > hidden type for `impl std::future::Future<Output = Result<(), ObjectStoreError>>`
     // > captures lifetime that does not appear in bounds
@@ -204,6 +213,14 @@ impl ObjectStore for GoogleCloudStorage {
 
     async fn remove_raw(&self, bucket: Bucket, key: &str) -> Result<(), ObjectStoreError> {
         self.remove_inner(bucket.as_str(), key).await
+    }
+
+    fn storage_prefix_raw(&self, bucket: Bucket) -> String {
+        format!(
+            "https://storage.googleapis.com/{}/{}",
+            self.bucket_prefix.clone(),
+            bucket.as_str()
+        )
     }
 }
 

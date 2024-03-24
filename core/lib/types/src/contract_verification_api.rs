@@ -6,9 +6,8 @@ use serde::{
     Deserialize, Serialize,
 };
 
-use crate::{Address, Bytes};
-
 pub use crate::Execute as ExecuteData;
+use crate::{Address, Bytes};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "codeFormat", content = "sourceCode")]
@@ -143,6 +142,8 @@ pub struct VerificationIncomingRequest {
     pub constructor_arguments: Bytes,
     #[serde(default)]
     pub is_system: bool,
+    #[serde(default)]
+    pub force_evmla: bool,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]

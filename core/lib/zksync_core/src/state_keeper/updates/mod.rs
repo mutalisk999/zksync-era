@@ -1,20 +1,22 @@
-use multivm::interface::{L1BatchEnv, VmExecutionResultAndLogs};
-
+use multivm::{
+    interface::{L1BatchEnv, SystemEnv, VmExecutionResultAndLogs},
+    utils::get_batch_base_fee,
+};
 use zksync_contracts::BaseSystemContractsHashes;
-use zksync_types::vm_trace::Call;
 use zksync_types::{
-    block::BlockGasCount, storage_writes_deduplicator::StorageWritesDeduplicator,
-    tx::tx_execution_info::ExecutionMetrics, Address, L1BatchNumber, MiniblockNumber,
-    ProtocolVersionId, Transaction,
+    block::BlockGasCount, fee_model::BatchFeeInput,
+    storage_writes_deduplicator::StorageWritesDeduplicator,
+    tx::tx_execution_info::ExecutionMetrics, vm_trace::Call, Address, L1BatchNumber,
+    MiniblockNumber, ProtocolVersionId, Transaction,
 };
 use zksync_utils::bytecode::CompressedBytecodeInfo;
 
+pub(crate) use self::{l1_batch_updates::L1BatchUpdates, miniblock_updates::MiniblockUpdates};
+use super::io::MiniblockParams;
+use crate::state_keeper::metrics::BATCH_TIP_METRICS;
+
 pub mod l1_batch_updates;
 pub mod miniblock_updates;
-
-pub(crate) use self::{l1_batch_updates::L1BatchUpdates, miniblock_updates::MiniblockUpdates};
-
-use super::io::MiniblockParams;
 
 /// Most of the information needed to seal the l1 batch/mini-block is contained within the VM,
 /// things that are not captured there are accumulated externally.
@@ -25,8 +27,8 @@ use super::io::MiniblockParams;
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdatesManager {
     batch_timestamp: u64,
-    l1_gas_price: u64,
-    fair_l2_gas_price: u64,
+    fee_account_address: Address,
+    batch_fee_input: BatchFeeInput,
     base_fee_per_gas: u64,
     base_system_contract_hashes: BaseSystemContractsHashes,
     protocol_version: ProtocolVersionId,
@@ -36,25 +38,22 @@ pub struct UpdatesManager {
 }
 
 impl UpdatesManager {
-    pub(crate) fn new(
-        l1_batch_env: L1BatchEnv,
-        base_system_contract_hashes: BaseSystemContractsHashes,
-        protocol_version: ProtocolVersionId,
-    ) -> Self {
+    pub(crate) fn new(l1_batch_env: &L1BatchEnv, system_env: &SystemEnv) -> Self {
+        let protocol_version = system_env.version;
         Self {
             batch_timestamp: l1_batch_env.timestamp,
-            l1_gas_price: l1_batch_env.l1_gas_price,
-            fair_l2_gas_price: l1_batch_env.fair_l2_gas_price,
-            base_fee_per_gas: l1_batch_env.base_fee(),
+            fee_account_address: l1_batch_env.fee_account,
+            batch_fee_input: l1_batch_env.fee_input,
+            base_fee_per_gas: get_batch_base_fee(l1_batch_env, protocol_version.into()),
             protocol_version,
-            base_system_contract_hashes,
+            base_system_contract_hashes: system_env.base_system_smart_contracts.hashes(),
             l1_batch: L1BatchUpdates::new(),
             miniblock: MiniblockUpdates::new(
                 l1_batch_env.first_l2_block.timestamp,
                 l1_batch_env.first_l2_block.number,
                 l1_batch_env.first_l2_block.prev_block_hash,
                 l1_batch_env.first_l2_block.max_virtual_blocks_to_create,
-                Some(protocol_version),
+                protocol_version,
             ),
             storage_writes_deduplicator: StorageWritesDeduplicator::new(),
         }
@@ -68,31 +67,25 @@ impl UpdatesManager {
         self.base_system_contract_hashes
     }
 
-    pub(crate) fn l1_gas_price(&self) -> u64 {
-        self.l1_gas_price
-    }
-
-    pub(crate) fn fair_l2_gas_price(&self) -> u64 {
-        self.fair_l2_gas_price
-    }
-
     pub(crate) fn seal_miniblock_command(
         &self,
         l1_batch_number: L1BatchNumber,
         miniblock_number: MiniblockNumber,
         l2_erc20_bridge_addr: Address,
+        pre_insert_txs: bool,
     ) -> MiniblockSealCommand {
         MiniblockSealCommand {
             l1_batch_number,
             miniblock_number,
             miniblock: self.miniblock.clone(),
             first_tx_index: self.l1_batch.executed_transactions.len(),
-            l1_gas_price: self.l1_gas_price,
-            fair_l2_gas_price: self.fair_l2_gas_price,
+            fee_account_address: self.fee_account_address,
+            fee_input: self.batch_fee_input,
             base_fee_per_gas: self.base_fee_per_gas,
             base_system_contracts_hashes: self.base_system_contract_hashes,
             protocol_version: Some(self.protocol_version),
             l2_erc20_bridge_addr,
+            pre_insert_txs,
         }
     }
 
@@ -121,10 +114,21 @@ impl UpdatesManager {
         );
     }
 
-    pub(crate) fn extend_from_fictive_transaction(&mut self, result: VmExecutionResultAndLogs) {
+    pub(crate) fn extend_from_fictive_transaction(
+        &mut self,
+        result: VmExecutionResultAndLogs,
+        l1_gas_count: BlockGasCount,
+        execution_metrics: ExecutionMetrics,
+    ) {
+        let before = self.storage_writes_deduplicator.metrics();
         self.storage_writes_deduplicator
             .apply(&result.logs.storage_logs);
-        self.miniblock.extend_from_fictive_transaction(result);
+        let after = self.storage_writes_deduplicator.metrics();
+
+        BATCH_TIP_METRICS.observe_writes_metrics(&before, &after, self.protocol_version());
+
+        self.miniblock
+            .extend_from_fictive_transaction(result, l1_gas_count, execution_metrics);
     }
 
     /// Pushes a new miniblock with the specified timestamp into this manager. The previously
@@ -135,7 +139,7 @@ impl UpdatesManager {
             self.miniblock.number + 1,
             self.miniblock.get_miniblock_hash(),
             miniblock_params.virtual_blocks,
-            Some(self.protocol_version),
+            self.protocol_version,
         );
         let old_miniblock_updates = std::mem::replace(&mut self.miniblock, new_miniblock_updates);
         self.l1_batch
@@ -166,12 +170,16 @@ pub(crate) struct MiniblockSealCommand {
     pub miniblock_number: MiniblockNumber,
     pub miniblock: MiniblockUpdates,
     pub first_tx_index: usize,
-    pub l1_gas_price: u64,
-    pub fair_l2_gas_price: u64,
+    pub fee_account_address: Address,
+    pub fee_input: BatchFeeInput,
     pub base_fee_per_gas: u64,
     pub base_system_contracts_hashes: BaseSystemContractsHashes,
     pub protocol_version: Option<ProtocolVersionId>,
     pub l2_erc20_bridge_addr: Address,
+    /// Whether transactions should be pre-inserted to DB.
+    /// Should be set to `true` for EN's IO as EN doesn't store transactions in DB
+    /// before they are included into miniblocks.
+    pub pre_insert_txs: bool,
 }
 
 #[cfg(test)]

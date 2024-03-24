@@ -18,14 +18,14 @@ use zksync_types::{
     block::BlockGasCount,
     fee::TransactionExecutionMetrics,
     tx::tx_execution_info::{DeduplicatedWritesMetrics, ExecutionMetrics},
-    Transaction,
+    ProtocolVersionId, Transaction,
 };
 use zksync_utils::time::millis_since;
 
 mod conditional_sealer;
 pub(super) mod criteria;
 
-pub(crate) use self::conditional_sealer::ConditionalSealer;
+pub use self::conditional_sealer::{ConditionalSealer, NoopSealer, SequencerSealer};
 use super::{extractors, metrics::AGGREGATION_METRICS, updates::UpdatesManager};
 use crate::gas_tracker::{gas_count_from_tx_and_metrics, gas_count_from_writes};
 
@@ -81,6 +81,7 @@ pub struct SealData {
     pub(super) gas_count: BlockGasCount,
     pub(super) cumulative_size: usize,
     pub(super) writes_metrics: DeduplicatedWritesMetrics,
+    pub(super) gas_remaining: u32,
 }
 
 impl SealData {
@@ -89,21 +90,23 @@ impl SealData {
     pub(crate) fn for_transaction(
         transaction: Transaction,
         tx_metrics: &TransactionExecutionMetrics,
+        protocol_version: ProtocolVersionId,
     ) -> Self {
         let execution_metrics = ExecutionMetrics::from_tx_metrics(tx_metrics);
         let writes_metrics = DeduplicatedWritesMetrics::from_tx_metrics(tx_metrics);
         let gas_count = gas_count_from_tx_and_metrics(&transaction, &execution_metrics)
-            + gas_count_from_writes(&writes_metrics);
+            + gas_count_from_writes(&writes_metrics, protocol_version);
         Self {
             execution_metrics,
             gas_count,
             cumulative_size: transaction.bootloader_encoding_size(),
             writes_metrics,
+            gas_remaining: tx_metrics.gas_remaining,
         }
     }
 }
 
-pub(super) trait SealCriterion: fmt::Debug + Send + 'static {
+pub(super) trait SealCriterion: fmt::Debug + Send + Sync + 'static {
     fn should_seal(
         &self,
         config: &StateKeeperConfig,
@@ -111,6 +114,7 @@ pub(super) trait SealCriterion: fmt::Debug + Send + 'static {
         tx_count: usize,
         block_data: &SealData,
         tx_data: &SealData,
+        protocol_version: ProtocolVersionId,
     ) -> SealResolution;
 
     // We need self here only for rust restrictions for creating an object from trait

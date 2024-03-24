@@ -1,18 +1,19 @@
-use rocksdb::{
-    properties, BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBPinnableSlice,
-    Direction, IteratorMode, Options, PrefixRange, ReadOptions, WriteOptions, DB,
-};
-
 use std::{
     collections::{HashMap, HashSet},
     ffi::CStr,
     fmt, iter,
     marker::PhantomData,
+    num::NonZeroU32,
     ops,
     path::Path,
     sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
+};
+
+use rocksdb::{
+    properties, BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBPinnableSlice,
+    Direction, IteratorMode, Options, PrefixRange, ReadOptions, WriteOptions, DB,
 };
 
 use crate::metrics::{RocksdbLabels, RocksdbSizeMetrics, METRICS};
@@ -274,6 +275,8 @@ pub struct RocksDBOptions {
     /// Timeout to wait for the database to run compaction on stalled writes during startup or
     /// when the corresponding RocksDB error is encountered.
     pub stalled_writes_retries: StalledWritesRetries,
+    /// Number of open files that can be used by the DB. Default is None, for no limit.
+    pub max_open_files: Option<NonZeroU32>,
 }
 
 impl Default for RocksDBOptions {
@@ -282,6 +285,7 @@ impl Default for RocksDBOptions {
             block_cache_capacity: None,
             large_memtable_capacity: None,
             stalled_writes_retries: StalledWritesRetries::new(Duration::from_secs(10)),
+            max_open_files: None,
         }
     }
 }
@@ -298,13 +302,19 @@ pub struct RocksDB<CF> {
 }
 
 impl<CF: NamedColumnFamily> RocksDB<CF> {
-    pub fn new(path: &Path) -> Self {
+    pub fn new(path: &Path) -> Result<Self, rocksdb::Error> {
         Self::with_options(path, RocksDBOptions::default())
     }
 
-    pub fn with_options(path: &Path, options: RocksDBOptions) -> Self {
+    pub fn with_options(path: &Path, options: RocksDBOptions) -> Result<Self, rocksdb::Error> {
         let caches = RocksDBCaches::new(options.block_cache_capacity);
-        let db_options = Self::rocksdb_options(None, None);
+        let mut db_options = Self::rocksdb_options(None, None);
+        let max_open_files = if let Some(non_zero) = options.max_open_files {
+            i32::try_from(non_zero.get()).unwrap_or(i32::MAX)
+        } else {
+            -1
+        };
+        db_options.set_max_open_files(max_open_files);
         let existing_cfs = DB::list_cf(&db_options, path).unwrap_or_else(|err| {
             tracing::warn!(
                 "Failed getting column families for RocksDB `{}` at `{}`, assuming CFs are empty; {err}",
@@ -354,7 +364,7 @@ impl<CF: NamedColumnFamily> RocksDB<CF> {
             ColumnFamilyDescriptor::new(cf_name, cf_options)
         });
 
-        let db = DB::open_cf_descriptors(&db_options, path, cfs).expect("failed to init rocksdb");
+        let db = DB::open_cf_descriptors(&db_options, path, cfs)?;
         let inner = Arc::new(RocksDBInner {
             db,
             db_name: CF::DB_NAME,
@@ -371,12 +381,12 @@ impl<CF: NamedColumnFamily> RocksDB<CF> {
         );
 
         inner.wait_for_writes_to_resume(&options.stalled_writes_retries);
-        Self {
+        Ok(Self {
             inner,
             sync_writes: false,
             stalled_writes_retries: options.stalled_writes_retries,
             _cf: PhantomData,
-        }
+        })
     }
 
     /// Switches on sync writes in [`Self::write()`] and [`Self::put()`]. This has a performance
@@ -529,7 +539,7 @@ impl<CF: NamedColumnFamily> RocksDB<CF> {
             .iterator_cf_opt(cf, options, IteratorMode::Start)
             .map(Result::unwrap)
             .fuse()
-        // ^ The rocksdb docs say that a raw iterator (which is used by the returned ordinary iterator)
+        // ^ The RocksDB docs say that a raw iterator (which is used by the returned ordinary iterator)
         // can become invalid "when it reaches the end of its defined range, or when it encounters an error."
         // We panic on RocksDB errors elsewhere and fuse it to prevent polling after the end of the range.
         // Thus, `unwrap()` should be safe.
@@ -553,7 +563,7 @@ impl<CF: NamedColumnFamily> RocksDB<CF> {
 }
 
 impl RocksDB<()> {
-    /// Awaits termination of all running rocksdb instances.
+    /// Awaits termination of all running RocksDB instances.
     ///
     /// This method is blocking and should be wrapped in `spawn_blocking(_)` if run in the async context.
     pub fn await_rocksdb_termination() {
@@ -570,7 +580,7 @@ impl RocksDB<()> {
     }
 }
 
-/// Empty struct used to register rocksdb instance
+/// Empty struct used to register RocksDB instance
 #[derive(Debug)]
 struct RegistryEntry;
 
@@ -665,13 +675,15 @@ mod tests {
     #[test]
     fn changing_column_families() {
         let temp_dir = TempDir::new().unwrap();
-        let db = RocksDB::<OldColumnFamilies>::new(temp_dir.path()).with_sync_writes();
+        let db = RocksDB::<OldColumnFamilies>::new(temp_dir.path())
+            .unwrap()
+            .with_sync_writes();
         let mut batch = db.new_write_batch();
         batch.put_cf(OldColumnFamilies::Default, b"test", b"value");
         db.write(batch).unwrap();
         drop(db);
 
-        let db = RocksDB::<NewColumnFamilies>::new(temp_dir.path());
+        let db = RocksDB::<NewColumnFamilies>::new(temp_dir.path()).unwrap();
         let value = db.get_cf(NewColumnFamilies::Default, b"test").unwrap();
         assert_eq!(value.unwrap(), b"value");
     }
@@ -691,13 +703,15 @@ mod tests {
     #[test]
     fn default_column_family_does_not_need_to_be_explicitly_opened() {
         let temp_dir = TempDir::new().unwrap();
-        let db = RocksDB::<OldColumnFamilies>::new(temp_dir.path()).with_sync_writes();
+        let db = RocksDB::<OldColumnFamilies>::new(temp_dir.path())
+            .unwrap()
+            .with_sync_writes();
         let mut batch = db.new_write_batch();
         batch.put_cf(OldColumnFamilies::Junk, b"test", b"value");
         db.write(batch).unwrap();
         drop(db);
 
-        let db = RocksDB::<JunkColumnFamily>::new(temp_dir.path());
+        let db = RocksDB::<JunkColumnFamily>::new(temp_dir.path()).unwrap();
         let value = db.get_cf(JunkColumnFamily, b"test").unwrap();
         assert_eq!(value.unwrap(), b"value");
     }
@@ -705,7 +719,9 @@ mod tests {
     #[test]
     fn write_batch_can_be_restored_from_bytes() {
         let temp_dir = TempDir::new().unwrap();
-        let db = RocksDB::<NewColumnFamilies>::new(temp_dir.path()).with_sync_writes();
+        let db = RocksDB::<NewColumnFamilies>::new(temp_dir.path())
+            .unwrap()
+            .with_sync_writes();
         let mut batch = db.new_write_batch();
         batch.put_cf(NewColumnFamilies::Default, b"test", b"value");
         batch.put_cf(NewColumnFamilies::Default, b"test2", b"value2");

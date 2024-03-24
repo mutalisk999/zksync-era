@@ -1,12 +1,12 @@
-use zk_evm_1_3_3::aux_structures::Timestamp;
+use zk_evm_1_4_1::aux_structures::Timestamp;
 use zksync_state::WriteStorage;
+use zksync_types::{circuit::CircuitStatistic, U256};
 
-use zksync_types::U256;
-
-use crate::interface::{VmExecutionStatistics, VmMemoryMetrics};
-use crate::vm_latest::old_vm::history_recorder::HistoryMode;
-use crate::vm_latest::tracers::DefaultExecutionTracer;
-use crate::vm_latest::vm::Vm;
+use crate::{
+    interface::{VmExecutionStatistics, VmMemoryMetrics},
+    vm_latest::{tracers::DefaultExecutionTracer, vm::Vm},
+    HistoryMode,
+};
 
 /// Module responsible for observing the VM behavior, i.e. calculating the statistics of the VM runs
 /// or reporting the VM memory usage.
@@ -18,11 +18,13 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
         &self,
         timestamp_initial: Timestamp,
         cycles_initial: u32,
-        tracer: &DefaultExecutionTracer<S, H>,
+        tracer: &DefaultExecutionTracer<S, H::Vm1_4_2>,
         gas_remaining_before: u32,
         gas_remaining_after: u32,
         spent_pubdata_counter_before: u32,
+        pubdata_published: u32,
         total_log_queries_count: usize,
+        circuit_statistic: CircuitStatistic,
     ) -> VmExecutionStatistics {
         let computational_gas_used = self.calculate_computational_gas_used(
             tracer,
@@ -36,12 +38,15 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
                 .get_decommitted_bytecodes_after_timestamp(timestamp_initial),
             cycles_used: self.state.local_state.monotonic_cycle_counter - cycles_initial,
             gas_used: gas_remaining_before - gas_remaining_after,
+            gas_remaining: gas_remaining_after,
             computational_gas_used,
             total_log_queries: total_log_queries_count,
+            pubdata_published,
+            circuit_statistic,
         }
     }
 
-    /// Returns the hashes the bytecodes that have been decommitted by the decomittment processor.
+    /// Returns the hashes the bytecodes that have been decommitted by the decommitment processor.
     pub(crate) fn get_used_contracts(&self) -> Vec<U256> {
         self.state
             .decommittment_processor
@@ -53,7 +58,7 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
     }
 
     /// Returns the info about all oracles' sizes.
-    pub fn record_vm_memory_metrics(&self) -> VmMemoryMetrics {
+    pub(crate) fn record_vm_memory_metrics_inner(&self) -> VmMemoryMetrics {
         VmMemoryMetrics {
             event_sink_inner: self.state.event_sink.get_size(),
             event_sink_history: self.state.event_sink.get_history_size(),

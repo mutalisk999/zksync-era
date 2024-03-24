@@ -1,23 +1,28 @@
-use zk_evm_1_3_3::aux_structures::Timestamp;
+use zk_evm_1_4_1::aux_structures::Timestamp;
 use zksync_state::WriteStorage;
 
-use crate::interface::{VmExecutionMode, VmExecutionResultAndLogs};
-use crate::vm_latest::old_vm::{
-    history_recorder::HistoryMode,
-    utils::{vm_may_have_ended_inner, VmExecutionResult},
+use crate::{
+    interface::{
+        types::tracer::{TracerExecutionStatus, VmExecutionStopReason},
+        VmExecutionMode, VmExecutionResultAndLogs, VmInterface,
+    },
+    vm_latest::{
+        old_vm::utils::{vm_may_have_ended_inner, VmExecutionResult},
+        tracers::{
+            circuits_capacity::circuit_statistic_from_cycles, dispatcher::TracerDispatcher,
+            DefaultExecutionTracer, PubdataTracer, RefundsTracer,
+        },
+        vm::Vm,
+    },
+    HistoryMode,
 };
-use crate::vm_latest::tracers::{
-    traits::{TracerExecutionStatus, VmTracer},
-    DefaultExecutionTracer, RefundsTracer,
-};
-use crate::vm_latest::vm::Vm;
-use crate::vm_latest::VmExecutionStopReason;
 
 impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
     pub(crate) fn inspect_inner(
         &mut self,
-        tracers: Vec<Box<dyn VmTracer<S, H>>>,
+        dispatcher: TracerDispatcher<S, H::Vm1_4_2>,
         execution_mode: VmExecutionMode,
+        custom_pubdata_tracer: Option<PubdataTracer<S>>,
     ) -> VmExecutionResultAndLogs {
         let mut enable_refund_tracer = false;
         if let VmExecutionMode::OneTx = execution_mode {
@@ -25,8 +30,13 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
             self.bootloader_state.move_tx_to_execute_pointer();
             enable_refund_tracer = true;
         }
-        let (_, result) =
-            self.inspect_and_collect_results(tracers, execution_mode, enable_refund_tracer);
+
+        let (_, result) = self.inspect_and_collect_results(
+            dispatcher,
+            execution_mode,
+            enable_refund_tracer,
+            custom_pubdata_tracer,
+        );
         result
     }
 
@@ -34,18 +44,21 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
     /// Collect the result from the default tracers.
     fn inspect_and_collect_results(
         &mut self,
-        tracers: Vec<Box<dyn VmTracer<S, H>>>,
+        dispatcher: TracerDispatcher<S, H::Vm1_4_2>,
         execution_mode: VmExecutionMode,
         with_refund_tracer: bool,
+        custom_pubdata_tracer: Option<PubdataTracer<S>>,
     ) -> (VmExecutionStopReason, VmExecutionResultAndLogs) {
         let refund_tracers =
             with_refund_tracer.then_some(RefundsTracer::new(self.batch_env.clone()));
-        let mut tx_tracer: DefaultExecutionTracer<S, H> = DefaultExecutionTracer::new(
+        let mut tx_tracer: DefaultExecutionTracer<S, H::Vm1_4_2> = DefaultExecutionTracer::new(
             self.system_env.default_validation_computational_gas_limit,
             execution_mode,
-            tracers,
+            dispatcher,
             self.storage.clone(),
             refund_tracers,
+            custom_pubdata_tracer
+                .or_else(|| Some(PubdataTracer::new(self.batch_env.clone(), execution_mode))),
         );
 
         let timestamp_initial = Timestamp(self.state.local_state.timestamp);
@@ -59,6 +72,12 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
 
         let logs = self.collect_execution_logs_after_timestamp(timestamp_initial);
 
+        let (refunds, pubdata_published) = tx_tracer
+            .refund_tracer
+            .as_ref()
+            .map(|x| (x.get_refunds(), x.pubdata_published()))
+            .unwrap_or_default();
+
         let statistics = self.get_statistics(
             timestamp_initial,
             cycles_initial,
@@ -66,15 +85,11 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
             gas_remaining_before,
             gas_remaining_after,
             spent_pubdata_counter_before,
+            pubdata_published,
             logs.total_log_queries_count,
+            circuit_statistic_from_cycles(tx_tracer.circuits_tracer.statistics),
         );
-
         let result = tx_tracer.result_tracer.into_result();
-
-        let refunds = tx_tracer
-            .refund_tracer
-            .map(|x| x.get_refunds())
-            .unwrap_or_default();
 
         let result = VmExecutionResultAndLogs {
             result,
@@ -89,7 +104,7 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
     /// Execute vm with given tracers until the stop reason is reached.
     fn execute_with_default_tracer(
         &mut self,
-        tracer: &mut DefaultExecutionTracer<S, H>,
+        tracer: &mut DefaultExecutionTracer<S, H::Vm1_4_2>,
     ) -> VmExecutionStopReason {
         tracer.initialize_tracer(&mut self.state);
         let result = loop {

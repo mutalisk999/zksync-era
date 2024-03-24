@@ -28,7 +28,7 @@ jobs:
         run: echo "sha=$(git merge-base HEAD FETCH_HEAD)" >> $GITHUB_OUTPUT
 
       - name: checkout divergence point
-        run: git checkout ${{ steps.merge_base.outputs.sha }}
+        run: git checkout ${{ steps.merge_base.outputs.sha }} --recurse-submodules
 
       - name: setup-env
         run: |
@@ -38,7 +38,7 @@ jobs:
 
       - name: init
         run: |
-          docker-compose -f docker-compose-runner.yml up -d zk
+          docker compose up -d zk
 
       - name: run benchmarks on base branch
         shell: bash
@@ -46,9 +46,11 @@ jobs:
           ci_run zk
           ci_run zk compiler system-contracts
           ci_run cargo bench --package vm-benchmark --bench iai | tee base-iai
+          ci_run cd core/tests/vm_benchmark && cargo run --release --bin instruction-counts | tee base-opcodes || touch base-opcodes
+          ci_run yarn workspace system-contracts clean
 
       - name: checkout PR
-        run: git checkout --force FETCH_HEAD
+        run: git checkout --force FETCH_HEAD --recurse-submodules
 
       - name: run benchmarks on PR
         shell: bash
@@ -56,10 +58,11 @@ jobs:
           ci_run zk
           ci_run zk compiler system-contracts
           ci_run cargo bench --package vm-benchmark --bench iai | tee pr-iai
+          ci_run cd core/tests/vm_benchmark && cargo run --release --bin instruction-counts | tee pr-opcodes || touch pr-opcodes
 
           EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
           echo "speedup<<$EOF" >> $GITHUB_OUTPUT
-          ci_run cargo run --package vm-benchmark --release --bin compare_iai_results base-iai pr-iai >> $GITHUB_OUTPUT
+          ci_run cargo run --package vm-benchmark --release --bin compare_iai_results base-iai pr-iai base-opcodes pr-opcodes >> $GITHUB_OUTPUT
           echo "$EOF" >> $GITHUB_OUTPUT
         id: comparison
 

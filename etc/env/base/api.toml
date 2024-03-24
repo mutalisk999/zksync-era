@@ -10,6 +10,7 @@ http_url="http://127.0.0.1:3050"
 ws_port=3051
 ws_url="ws://127.0.0.1:3051"
 req_entities_limit=10000
+filters_disabled=false
 filters_limit=10000
 subscriptions_limit=10000
 # Interval between polling db for pubsub (in ms).
@@ -17,6 +18,7 @@ pubsub_polling_interval=200
 threads_per_server=128
 max_nonce_ahead=50
 gas_price_scale_factor=1.2
+l1_to_l2_transactions_compatibility_mode=true
 request_timeout=10
 account_pks=[
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",

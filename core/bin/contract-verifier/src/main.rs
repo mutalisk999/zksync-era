@@ -1,14 +1,17 @@
 use std::cell::RefCell;
 
 use anyhow::Context as _;
+use futures::{channel::mpsc, executor::block_on, SinkExt, StreamExt};
 use prometheus_exporter::PrometheusExporterConfig;
-use zksync_config::{configs::PrometheusConfig, ApiConfig, ContractVerifierConfig};
-use zksync_dal::ConnectionPool;
+use tokio::sync::watch;
+use zksync_config::{
+    configs::{ObservabilityConfig, PrometheusConfig},
+    ApiConfig, ContractVerifierConfig, PostgresConfig,
+};
+use zksync_dal::{ConnectionPool, Core, CoreDal};
+use zksync_env_config::FromEnv;
 use zksync_queued_job_processor::JobProcessor;
 use zksync_utils::wait_for_tasks::wait_for_tasks;
-
-use futures::{channel::mpsc, executor::block_on, SinkExt, StreamExt};
-use tokio::sync::watch;
 
 use crate::verifier::ContractVerifier;
 
@@ -17,8 +20,8 @@ pub mod verifier;
 pub mod zksolc_utils;
 pub mod zkvyper_utils;
 
-async fn update_compiler_versions(connection_pool: &ConnectionPool) {
-    let mut storage = connection_pool.access_storage().await.unwrap();
+async fn update_compiler_versions(connection_pool: &ConnectionPool<Core>) {
+    let mut storage = connection_pool.connection().await.unwrap();
     let mut transaction = storage.start_transaction().await.unwrap();
 
     let zksync_home = std::env::var("ZKSYNC_HOME").unwrap_or_else(|_| ".".into());
@@ -112,7 +115,6 @@ async fn update_compiler_versions(connection_pool: &ConnectionPool) {
 }
 
 use structopt::StructOpt;
-use zksync_dal::connection::DbVariant;
 
 #[derive(StructOpt)]
 #[structopt(name = "zkSync contract code verifier", author = "Matter Labs")]
@@ -131,29 +133,33 @@ async fn main() -> anyhow::Result<()> {
         listener_port: verifier_config.prometheus_port,
         ..ApiConfig::from_env().context("ApiConfig")?.prometheus
     };
-    let pool = ConnectionPool::singleton(DbVariant::Master)
-        .build()
-        .await
-        .unwrap();
+    let postgres_config = PostgresConfig::from_env().context("PostgresConfig")?;
+    let pool = ConnectionPool::<Core>::singleton(
+        postgres_config
+            .master_url()
+            .context("Master DB URL is absent")?,
+    )
+    .build()
+    .await
+    .unwrap();
 
-    #[allow(deprecated)] // TODO (QIT-21): Use centralized configuration approach.
-    let log_format = vlog::log_format_from_env();
-    #[allow(deprecated)] // TODO (QIT-21): Use centralized configuration approach.
-    let sentry_url = vlog::sentry_url_from_env();
-    #[allow(deprecated)] // TODO (QIT-21): Use centralized configuration approach.
-    let environment = vlog::environment_from_env();
-
+    let observability_config =
+        ObservabilityConfig::from_env().context("ObservabilityConfig::from_env()")?;
+    let log_format: vlog::LogFormat = observability_config
+        .log_format
+        .parse()
+        .context("Invalid log format")?;
     let mut builder = vlog::ObservabilityBuilder::new().with_log_format(log_format);
-    if let Some(sentry_url) = &sentry_url {
+    if let Some(sentry_url) = &observability_config.sentry_url {
         builder = builder
             .with_sentry_url(sentry_url)
             .expect("Invalid Sentry URL")
-            .with_sentry_environment(environment);
+            .with_sentry_environment(observability_config.sentry_environment);
     }
     let _guard = builder.build();
 
     // Report whether sentry is running after the logging subsystem was initialized.
-    if let Some(sentry_url) = sentry_url {
+    if let Some(sentry_url) = observability_config.sentry_url {
         tracing::info!("Sentry configured with URL: {sentry_url}");
     } else {
         tracing::info!("No sentry URL was provided");
@@ -174,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
 
     let contract_verifier = ContractVerifier::new(verifier_config, pool);
     let tasks = vec![
-        // todo PLA-335: Leftovers after the prover DB split.
+        // TODO PLA-335: Leftovers after the prover DB split.
         // The prover connection pool is not used by the contract verifier, but we need to pass it
         // since `JobProcessor` trait requires it.
         tokio::spawn(contract_verifier.run(stop_receiver.clone(), opt.jobs_number)),

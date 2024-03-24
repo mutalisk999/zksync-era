@@ -8,18 +8,21 @@ import fs from 'fs';
 import { TransactionResponse } from 'zksync-web3/build/src/types';
 import { BytesLike } from '@ethersproject/bytes';
 
-const L1_CONTRACTS_FOLDER = `${process.env.ZKSYNC_HOME}/contracts/ethereum/artifacts/cache/solpp-generated-contracts`;
+const L1_CONTRACTS_FOLDER = `${process.env.ZKSYNC_HOME}/contracts/l1-contracts/artifacts/cache/solpp-generated-contracts`;
 const L1_DEFAULT_UPGRADE_ABI = new ethers.utils.Interface(
     require(`${L1_CONTRACTS_FOLDER}/upgrades/DefaultUpgrade.sol/DefaultUpgrade.json`).abi
 );
-const DIAMOND_CUT_FACET_ABI = new ethers.utils.Interface(
-    require(`${L1_CONTRACTS_FOLDER}/zksync/facets/DiamondCut.sol/DiamondCutFacet.json`).abi
+const GOVERNANCE_ABI = new ethers.utils.Interface(
+    require(`${L1_CONTRACTS_FOLDER}/governance/Governance.sol/Governance.json`).abi
+);
+const ADMIN_FACET_ABI = new ethers.utils.Interface(
+    require(`${L1_CONTRACTS_FOLDER}/zksync/facets/Admin.sol/AdminFacet.json`).abi
 );
 const L2_FORCE_DEPLOY_UPGRADER_ABI = new ethers.utils.Interface(
-    require(`${process.env.ZKSYNC_HOME}/contracts/zksync/artifacts-zk/cache-zk/solpp-generated-contracts/ForceDeployUpgrader.sol/ForceDeployUpgrader.json`).abi
+    require(`${process.env.ZKSYNC_HOME}/contracts/l2-contracts/artifacts-zk/cache-zk/solpp-generated-contracts/ForceDeployUpgrader.sol/ForceDeployUpgrader.json`).abi
 );
 const COMPLEX_UPGRADER_ABI = new ethers.utils.Interface(
-    require(`${process.env.ZKSYNC_HOME}/etc/system-contracts/artifacts-zk/cache-zk/solpp-generated-contracts/ComplexUpgrader.sol/ComplexUpgrader.json`).abi
+    require(`${process.env.ZKSYNC_HOME}/contracts/system-contracts/artifacts-zk/contracts-preprocessed/ComplexUpgrader.sol/ComplexUpgrader.json`).abi
 );
 const COUNTER_BYTECODE =
     require(`${process.env.ZKSYNC_HOME}/core/tests/ts-integration/artifacts-zk/contracts/counter/counter.sol/Counter.json`).deployedBytecode;
@@ -30,9 +33,10 @@ describe('Upgrade test', function () {
     let alice: zkweb3.Wallet;
     let govWallet: ethers.Wallet;
     let mainContract: ethers.Contract;
+    let governanceContract: ethers.Contract;
     let bootloaderHash: string;
-    let proposeUpgradeCalldata: string;
-    let executeUpgradeCalldata: string;
+    let scheduleTransparentOperation: string;
+    let executeOperation: string;
     let forceDeployAddress: string;
     let forceDeployBytecode: string;
     let logs: fs.WriteStream;
@@ -51,7 +55,7 @@ describe('Upgrade test', function () {
         try {
             await utils.exec('pkill zksync_server');
             // It may take some time for witness generator to stop.
-            await utils.sleep(120);
+            await utils.sleep(10);
         } catch (_) {}
 
         // Set small timeouts.
@@ -62,7 +66,7 @@ describe('Upgrade test', function () {
         process.env.CHAIN_STATE_KEEPER_BLOCK_COMMIT_DEADLINE_MS = '2000';
         // Run server in background.
         utils.background(
-            'cd $ZKSYNC_HOME && cargo run --bin zksync_server --release -- --components=api,tree,eth,data_fetcher,state_keeper',
+            'cd $ZKSYNC_HOME && cargo run --bin zksync_server --release -- --components=api,tree,eth,state_keeper,commitment_generator',
             [null, logs, logs]
         );
         // Server may need some time to recompile if it's a cold run, so wait for it.
@@ -71,13 +75,15 @@ describe('Upgrade test', function () {
             try {
                 mainContract = await tester.syncWallet.getMainContract();
             } catch (_) {
-                await utils.sleep(5);
+                await utils.sleep(1);
             }
             iter += 1;
         }
         if (!mainContract) {
             throw new Error('Server did not start');
         }
+        const governanceContractAddr = await mainContract.getGovernor();
+        governanceContract = new zkweb3.Contract(governanceContractAddr, GOVERNANCE_ABI, tester.syncWallet);
         let blocksCommitted = await mainContract.getTotalBlocksCommitted();
 
         const initialL1BatchNumber = await tester.web3Provider.getL1BatchNumber();
@@ -124,7 +130,7 @@ describe('Upgrade test', function () {
     });
 
     step('Send l1 tx for saving new bootloader', async () => {
-        const path = `${process.env.ZKSYNC_HOME}/etc/system-contracts/bootloader/build/artifacts/playground_batch.yul/playground_batch.yul.zbin`;
+        const path = `${process.env.ZKSYNC_HOME}/contracts/system-contracts/bootloader/build/artifacts/playground_batch.yul.zbin`;
         const bootloaderCode = ethers.utils.hexlify(fs.readFileSync(path));
         bootloaderHash = ethers.utils.hexlify(hashBytecode(bootloaderCode));
         const txHandle = await tester.syncWallet.requestExecute({
@@ -140,7 +146,7 @@ describe('Upgrade test', function () {
         await waitForNewL1Batch(alice);
     });
 
-    step('Propose upgrade', async () => {
+    step('Schedule governance call', async () => {
         forceDeployAddress = '0xf04ce00000000000000000000000000000000000';
         forceDeployBytecode = COUNTER_BYTECODE;
 
@@ -180,18 +186,18 @@ describe('Upgrade test', function () {
             upgradeTimestamp: 0,
             newProtocolVersion
         });
-        proposeUpgradeCalldata = calldata.proposeTransparentUpgrade;
-        executeUpgradeCalldata = calldata.executeUpgrade;
+        scheduleTransparentOperation = calldata.scheduleTransparentOperation;
+        executeOperation = calldata.executeOperation;
 
         await (
             await govWallet.sendTransaction({
-                to: mainContract.address,
-                data: proposeUpgradeCalldata
+                to: governanceContract.address,
+                data: scheduleTransparentOperation
             })
         ).wait();
 
         // Wait for server to process L1 event.
-        await utils.sleep(10);
+        await utils.sleep(2);
     });
 
     step('Check bootloader is updated on L2', async () => {
@@ -215,7 +221,7 @@ describe('Upgrade test', function () {
         while (lastBatchExecuted < l1BatchNumber && tryCount < 10) {
             lastBatchExecuted = await mainContract.getTotalBlocksExecuted();
             tryCount += 1;
-            await utils.sleep(3);
+            await utils.sleep(2);
         }
         if (lastBatchExecuted < l1BatchNumber) {
             throw new Error('Server did not execute old blocks');
@@ -224,8 +230,8 @@ describe('Upgrade test', function () {
         // Send execute tx.
         await (
             await govWallet.sendTransaction({
-                to: mainContract.address,
-                data: executeUpgradeCalldata
+                to: governanceContract.address,
+                data: executeOperation
             })
         ).wait();
 
@@ -247,14 +253,14 @@ describe('Upgrade test', function () {
     step('Execute transactions after simple restart', async () => {
         // Stop server.
         await utils.exec('pkill zksync_server');
-        await utils.sleep(10);
+        await utils.sleep(5);
 
         // Run again.
         utils.background(
-            'cd $ZKSYNC_HOME && cargo run --bin zksync_server --release -- --components=api,tree,eth,data_fetcher,state_keeper &>> upgrade.log',
+            'cd $ZKSYNC_HOME && cargo run --bin zksync_server --release -- --components=api,tree,eth,state_keeper,commitment_generator &> upgrade.log',
             [null, logs, logs]
         );
-        await utils.sleep(10);
+        await utils.sleep(5);
 
         // Trying to send a transaction from the same address again
         await checkedRandomTransfer(alice, BigNumber.from(1));
@@ -366,13 +372,6 @@ async function prepareUpgradeCalldata(
     const zkSyncContract = await l2Provider.getMainContractAddress();
     const zkSync = new ethers.Contract(zkSyncContract, zkweb3.utils.ZKSYNC_MAIN_ABI, govWallet);
 
-    // In case there is some pending upgrade there, we cancel it
-    const upgradeProposalState = await zkSync.getUpgradeProposalState();
-    if (upgradeProposalState != 0) {
-        const currentProposalHash = await zkSync.getProposedUpgradeHash();
-        await (await zkSync.connect(govWallet).cancelUpgradeProposal(currentProposalHash)).wait();
-    }
-
     const newProtocolVersion = params.newProtocolVersion ?? (await zkSync.getProtocolVersion()).add(1);
     params.l2ProtocolUpgradeTx.nonce ??= newProtocolVersion;
     const upgradeInitData = L1_DEFAULT_UPGRADE_ABI.encodeFunctionData('upgrade', [
@@ -397,21 +396,32 @@ async function prepareUpgradeCalldata(
         initAddress: upgradeAddress,
         initCalldata: upgradeInitData
     };
-    const currentProposalId = (await zkSync.getCurrentProposalId()).add(1);
-    // Get transaction data of the `proposeTransparentUpgrade`
-    const proposeTransparentUpgrade = DIAMOND_CUT_FACET_ABI.encodeFunctionData('proposeTransparentUpgrade', [
-        upgradeParam,
-        currentProposalId
+
+    // Prepare calldata for upgrading diamond proxy
+    const diamondProxyUpgradeCalldata = ADMIN_FACET_ABI.encodeFunctionData('executeUpgrade', [upgradeParam]);
+
+    const call = {
+        target: zkSyncContract,
+        value: 0,
+        data: diamondProxyUpgradeCalldata
+    };
+    const governanceOperation = {
+        calls: [call],
+        predecessor: ethers.constants.HashZero,
+        salt: ethers.constants.HashZero
+    };
+
+    // Get transaction data of the `scheduleTransparent`
+    const scheduleTransparentOperation = GOVERNANCE_ABI.encodeFunctionData('scheduleTransparent', [
+        governanceOperation,
+        0 // delay
     ]);
 
-    // Get transaction data of the `executeUpgrade`
-    const executeUpgrade = DIAMOND_CUT_FACET_ABI.encodeFunctionData('executeUpgrade', [
-        upgradeParam,
-        ethers.constants.HashZero
-    ]);
+    // Get transaction data of the `execute`
+    const executeOperation = GOVERNANCE_ABI.encodeFunctionData('execute', [governanceOperation]);
 
     return {
-        proposeTransparentUpgrade,
-        executeUpgrade
+        scheduleTransparentOperation,
+        executeOperation
     };
 }

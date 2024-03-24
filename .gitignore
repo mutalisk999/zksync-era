@@ -20,6 +20,7 @@ tags
 # Yarn files
 .yarn/
 .yarnrc.yml
+.yarnrc
 
 zksync_pk.key
 dist
@@ -27,15 +28,16 @@ todo
 
 Cargo.lock
 !/Cargo.lock
-!/core/bin/verification_key_generator_and_server/Cargo.lock
 !/infrastructure/zksync-crypto/Cargo.lock
 !/prover/Cargo.lock
 
 /etc/env/*
 !/etc/env/base
+!/etc/env/dev.toml
 !/etc/env/docker.toml
 !/etc/env/ext-node.toml
 !/etc/env/ext-node-docker.toml
+!/etc/env/*.yaml
 /etc/tokens/localhost.json
 /etc/zksolc-bin/*
 /etc/zkvyper-bin/*
@@ -71,4 +73,7 @@ cache-zk/
 zksolc
 verified_sources
 
+# Hyperchain related
 hyperchain-*.yml
+/etc/hyperchains/prover-keys
+/etc/hyperchains/artifacts

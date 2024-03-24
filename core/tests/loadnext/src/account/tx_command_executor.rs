@@ -1,12 +1,13 @@
 use std::time::Instant;
-use zksync::web3::ethabi;
-use zksync::EthNamespaceClient;
+
 use zksync::{
     error::ClientError,
     ethereum::PriorityOpHolder,
     utils::{
         get_approval_based_paymaster_input, get_approval_based_paymaster_input_for_estimation,
     },
+    web3::ethabi,
+    EthNamespaceClient,
 };
 use zksync_eth_client::EthInterface;
 use zksync_system_constants::MAX_L1_TRANSACTION_GAS_LIMIT;
@@ -16,14 +17,15 @@ use zksync_types::{
     Address, H256, U256,
 };
 
-use crate::account::ExecutionType;
-use crate::utils::format_gwei;
 use crate::{
-    account::AccountLifespan,
+    account::{AccountLifespan, ExecutionType},
     command::{IncorrectnessModifier, TxCommand, TxType},
-    constants::{ETH_CONFIRMATION_TIMEOUT, ETH_POLLING_INTERVAL},
+    constants::{
+        ETH_CONFIRMATION_TIMEOUT, ETH_POLLING_INTERVAL, MIN_ALLOWANCE_FOR_PAYMASTER_ESTIMATE,
+    },
     corrupted_tx::Corrupted,
     report::ReportLabel,
+    utils::format_gwei,
 };
 
 #[derive(Debug)]
@@ -201,7 +203,7 @@ impl AccountLifespan {
         }?;
 
         // Update current nonce for future txs
-        // If the transaction has a tx_hash and is small enough to be included in a block, this tx will change the nonce.
+        // If the transaction has a `tx_hash` and is small enough to be included in a block, this tx will change the nonce.
         // We can be sure that the nonce will be changed based on this assumption.
         if let SubmitResult::TxHash(_) = &result {
             self.current_nonce = Some(nonce + 1)
@@ -228,6 +230,7 @@ impl AccountLifespan {
             .estimate_fee(Some(get_approval_based_paymaster_input_for_estimation(
                 self.paymaster_address,
                 self.main_l2_token,
+                MIN_ALLOWANCE_FOR_PAYMASTER_ESTIMATE.into(),
             )))
             .await?;
         builder = builder.fee(fee.clone());
@@ -276,6 +279,7 @@ impl AccountLifespan {
             .estimate_fee(Some(get_approval_based_paymaster_input_for_estimation(
                 self.paymaster_address,
                 self.main_l2_token,
+                MIN_ALLOWANCE_FOR_PAYMASTER_ESTIMATE.into(),
             )))
             .await?;
         builder = builder.fee(fee.clone());
@@ -403,6 +407,7 @@ impl AccountLifespan {
             .estimate_fee(Some(get_approval_based_paymaster_input_for_estimation(
                 self.paymaster_address,
                 self.main_l2_token,
+                MIN_ALLOWANCE_FOR_PAYMASTER_ESTIMATE.into(),
             )))
             .await?;
         tracing::trace!(
@@ -445,13 +450,11 @@ impl AccountLifespan {
             .get_transaction_receipt(tx_hash)
             .await?;
 
-        let receipt = if response.as_ref().and_then(|r| r.block_number).is_some() {
-            response.unwrap()
-        } else {
+        let Some(receipt) = response else {
             return Ok(None);
         };
 
-        let block_number = receipt.block_number.unwrap();
+        let block_number = receipt.block_number;
 
         let response = self
             .wallet

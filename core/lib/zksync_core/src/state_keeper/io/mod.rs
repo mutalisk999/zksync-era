@@ -1,31 +1,28 @@
-use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
-
 use std::{
     fmt,
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use multivm::interface::{FinishedL1Batch, L1BatchEnv, SystemEnv};
-
-use zksync_dal::ConnectionPool;
+use tokio::sync::{mpsc, oneshot};
+use zksync_dal::{ConnectionPool, Core};
 use zksync_types::{
-    block::MiniblockExecutionData, protocol_version::ProtocolUpgradeTx,
+    block::MiniblockExecutionData, protocol_upgrade::ProtocolUpgradeTx,
     witness_block_state::WitnessBlockState, L1BatchNumber, MiniblockNumber, ProtocolVersionId,
     Transaction,
 };
 
-pub(crate) mod common;
-pub(crate) mod mempool;
-pub(crate) mod seal_logic;
-
-pub(crate) use self::mempool::MempoolIO;
 use super::{
     metrics::{MiniblockQueueStage, MINIBLOCK_METRICS},
     seal_criteria::IoSealCriteria,
     updates::{MiniblockSealCommand, UpdatesManager},
 };
 
+pub(crate) mod common;
+pub(crate) mod fee_address_migration;
+pub(crate) mod mempool;
+pub(crate) mod seal_logic;
 #[cfg(test)]
 mod tests;
 
@@ -65,36 +62,41 @@ pub struct MiniblockParams {
 /// `StateKeeperIO` provides the interactive layer for the state keeper:
 /// it's used to receive volatile parameters (such as batch parameters), and also it's used to perform
 /// mutable operations on the persistent state (e.g. persist executed batches).
+///
+/// All errors returned from this method are treated as unrecoverable.
 #[async_trait]
 pub trait StateKeeperIO: 'static + Send + IoSealCriteria {
     /// Returns the number of the currently processed L1 batch.
     fn current_l1_batch_number(&self) -> L1BatchNumber;
     /// Returns the number of the currently processed miniblock (aka L2 block).
     fn current_miniblock_number(&self) -> MiniblockNumber;
+
     /// Returns the data on the batch that was not sealed before the server restart.
     /// See `PendingBatchData` doc-comment for details.
-    async fn load_pending_batch(&mut self) -> Option<PendingBatchData>;
+    async fn load_pending_batch(&mut self) -> anyhow::Result<Option<PendingBatchData>>;
+
     /// Blocks for up to `max_wait` until the parameters for the next L1 batch are available.
     /// Returns the data required to initialize the VM for the next batch.
     async fn wait_for_new_batch_params(
         &mut self,
         max_wait: Duration,
-    ) -> Option<(SystemEnv, L1BatchEnv)>;
+    ) -> anyhow::Result<Option<(SystemEnv, L1BatchEnv)>>;
+
     /// Blocks for up to `max_wait` until the parameters for the next miniblock are available.
     async fn wait_for_new_miniblock_params(
         &mut self,
         max_wait: Duration,
-        prev_miniblock_timestamp: u64,
-    ) -> Option<MiniblockParams>;
+    ) -> anyhow::Result<Option<MiniblockParams>>;
+
     /// Blocks for up to `max_wait` until the next transaction is available for execution.
     /// Returns `None` if no transaction became available until the timeout.
     async fn wait_for_next_tx(&mut self, max_wait: Duration) -> Option<Transaction>;
     /// Marks the transaction as "not executed", so it can be retrieved from the IO again.
     async fn rollback(&mut self, tx: Transaction);
     /// Marks the transaction as "rejected", e.g. one that is not correct and can't be executed.
-    async fn reject(&mut self, tx: &Transaction, error: &str);
-    /// Marks the miniblock (aka L2 block) as sealed.
-    /// Returns the timestamp for the next miniblock.
+    async fn reject(&mut self, tx: &Transaction, error: &str) -> anyhow::Result<()>;
+
+    /// Marks the miniblock (aka L2 block) as sealed. Returns the timestamp for the next miniblock.
     async fn seal_miniblock(&mut self, updates_manager: &UpdatesManager);
     /// Marks the L1 batch as sealed.
     async fn seal_l1_batch(
@@ -104,11 +106,14 @@ pub trait StateKeeperIO: 'static + Send + IoSealCriteria {
         l1_batch_env: &L1BatchEnv,
         finished_batch: FinishedL1Batch,
     ) -> anyhow::Result<()>;
+
     /// Loads protocol version of the previous l1 batch.
-    async fn load_previous_batch_version_id(&mut self) -> Option<ProtocolVersionId>;
+    async fn load_previous_batch_version_id(&mut self) -> anyhow::Result<ProtocolVersionId>;
     /// Loads protocol upgrade tx for given version.
-    async fn load_upgrade_tx(&mut self, version_id: ProtocolVersionId)
-        -> Option<ProtocolUpgradeTx>;
+    async fn load_upgrade_tx(
+        &mut self,
+        version_id: ProtocolVersionId,
+    ) -> anyhow::Result<Option<ProtocolUpgradeTx>>;
 }
 
 impl fmt::Debug for dyn StateKeeperIO {
@@ -130,7 +135,7 @@ struct Completable<T> {
 
 /// Handle for [`MiniblockSealer`] allowing to submit [`MiniblockSealCommand`]s.
 #[derive(Debug)]
-pub(crate) struct MiniblockSealerHandle {
+pub struct MiniblockSealerHandle {
     commands_sender: mpsc::Sender<Completable<MiniblockSealCommand>>,
     latest_completion_receiver: Option<oneshot::Receiver<()>>,
     // If true, `submit()` will wait for the operation to complete.
@@ -143,8 +148,8 @@ impl MiniblockSealerHandle {
     /// Submits a new sealing `command` to the sealer that this handle is attached to.
     ///
     /// If there are currently too many unprocessed commands, this method will wait until
-    /// enough of them are processed (i.e., there is backpressure).
-    pub async fn submit(&mut self, command: MiniblockSealCommand) {
+    /// enough of them are processed (i.e., there is back pressure).
+    pub(crate) async fn submit(&mut self, command: MiniblockSealCommand) {
         let miniblock_number = command.miniblock_number;
         tracing::debug!(
             "Enqueuing sealing command for miniblock #{miniblock_number} with #{} txs (L1 batch #{})",
@@ -209,8 +214,8 @@ impl MiniblockSealerHandle {
 
 /// Component responsible for sealing miniblocks (i.e., storing their data to Postgres).
 #[derive(Debug)]
-pub(crate) struct MiniblockSealer {
-    pool: ConnectionPool,
+pub struct MiniblockSealer {
+    pool: ConnectionPool<Core>,
     is_sync: bool,
     // Weak sender handle to get queue capacity stats.
     commands_sender: mpsc::WeakSender<Completable<MiniblockSealCommand>>,
@@ -220,8 +225,8 @@ pub(crate) struct MiniblockSealer {
 impl MiniblockSealer {
     /// Creates a sealer that will use the provided Postgres connection and will have the specified
     /// `command_capacity` for unprocessed sealing commands.
-    pub(crate) fn new(
-        pool: ConnectionPool,
+    pub fn new(
+        pool: ConnectionPool<Core>,
         mut command_capacity: usize,
     ) -> (Self, MiniblockSealerHandle) {
         let is_sync = command_capacity == 0;
@@ -260,11 +265,7 @@ impl MiniblockSealer {
         // Commands must be processed sequentially: a later miniblock cannot be saved before
         // an earlier one.
         while let Some(completable) = self.next_command().await {
-            let mut conn = self
-                .pool
-                .access_storage_tagged("state_keeper")
-                .await
-                .unwrap();
+            let mut conn = self.pool.connection_tagged("state_keeper").await.unwrap();
             completable.command.seal(&mut conn).await;
             if let Some(delta) = miniblock_seal_delta {
                 MINIBLOCK_METRICS.seal_delta.observe(delta.elapsed());

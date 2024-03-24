@@ -46,28 +46,29 @@ RUN apt-get update && apt-get install -y \
     jq \
     openssh-server \
     openssh-client \
-    wget \
     vim \
     ca-certificates \
     gnupg2 \
     postgresql-client \
     wget \
-    bzip2
+    bzip2 \
+    hub \
+    unzip
 
 # Install dependencies for RocksDB.
 RUN apt-get update && \
     apt-get install -y \
-    curl \
     gnutls-bin git \
     build-essential \
     clang-15 \
     lldb-15 \
     lld-15 \
-    liburing-dev
+    liburing-dev \
+    libclang-dev
 
 # Install Docker
 RUN apt-get update && \
-    apt-get install ca-certificates curl gnupg && \
+    apt-get install ca-certificates gnupg && \
     install -m 0755 -d /etc/apt/keyrings && \
     wget -c -O - https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
     chmod a+r /etc/apt/keyrings/docker.gpg && \
@@ -82,8 +83,8 @@ ENV NODE_MAJOR=18
 RUN mkdir -p /etc/apt/keyrings && \
     wget -c -O - https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update && apt-get install nodejs -y && \
-    npm install -g yarn
+    apt-get update && apt-get install nodejs npm -y && \
+    npm install -g yarn && npm install -g cspell && npm install -g markdown-link-check
 
 # Install Rust and required cargo packages
 ENV RUSTUP_HOME=/usr/local/rustup \
@@ -102,17 +103,17 @@ RUN echo "deb [arch=${ARCH}] http://packages.cloud.google.com/apt cloud-sdk main
 RUN wget -c -O - https://sh.rustup.rs | bash -s -- -y && \
     rustup default stable
 
-RUN cargo install --version=0.5.13 sqlx-cli
-RUN cargo install cargo-tarpaulin
+RUN cargo install --version=0.7.3 sqlx-cli
 RUN cargo install cargo-nextest
+RUN cargo install cargo-spellcheck
 
 # Copy compiler (both solc and zksolc) binaries
 # Obtain `solc` 0.8.20.
 COPY --from=solidity-builder /solidity/build/solc/solc /usr/bin/
 RUN chmod +x /usr/bin/solc
-# Obtain `zksolc` 1.3.15.
-RUN wget -c https://github.com/matter-labs/zksolc-bin/raw/main/linux-${ARCH}/zksolc-linux-${ARCH}-musl-v1.3.15 \
-    && mv zksolc-linux-${ARCH}-musl-v1.3.15 /usr/bin/zksolc \
+# Obtain `zksolc` 1.3.16.
+RUN wget -c https://github.com/matter-labs/zksolc-bin/raw/main/linux-${ARCH}/zksolc-linux-${ARCH}-musl-v1.3.16 \
+    && mv zksolc-linux-${ARCH}-musl-v1.3.16 /usr/bin/zksolc \
     && chmod +x /usr/bin/zksolc
 
 # Somehow it is installed with some other packages
@@ -133,5 +134,5 @@ ENV RUSTC_WRAPPER=/usr/local/cargo/bin/sccache
 
 FROM rust-lightweight as rust-lightweight-nightly
 
-RUN rustup install nightly-2023-07-21 && \
-    rustup default nightly-2023-07-21
+RUN rustup install nightly-2023-08-21 && \
+    rustup default nightly-2023-08-21

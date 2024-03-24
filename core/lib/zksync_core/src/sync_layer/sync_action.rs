@@ -1,17 +1,12 @@
 use tokio::sync::mpsc;
+use zksync_types::{Address, L1BatchNumber, MiniblockNumber, ProtocolVersionId};
 
-use zksync_types::{Address, L1BatchNumber, MiniblockNumber, ProtocolVersionId, Transaction, H256};
-
-use super::metrics::QUEUE_METRICS;
+use super::{fetcher::FetchedTransaction, metrics::QUEUE_METRICS};
 
 #[derive(Debug)]
 pub struct ActionQueueSender(mpsc::Sender<SyncAction>);
 
 impl ActionQueueSender {
-    pub(crate) fn has_action_capacity(&self) -> bool {
-        self.0.capacity() > 0
-    }
-
     /// Pushes a set of actions to the queue.
     ///
     /// Requires that the actions are in the correct order: starts with a new open batch/miniblock,
@@ -89,7 +84,7 @@ impl ActionQueue {
     }
 
     /// Removes the first action from the queue.
-    pub(crate) fn pop_action(&mut self) -> Option<SyncAction> {
+    pub(super) fn pop_action(&mut self) -> Option<SyncAction> {
         if let Some(peeked) = self.peeked.take() {
             QUEUE_METRICS.action_queue_size.dec_by(1);
             return Some(peeked);
@@ -102,7 +97,7 @@ impl ActionQueue {
     }
 
     /// Returns the first action from the queue without removing it.
-    pub(crate) fn peek_action(&mut self) -> Option<SyncAction> {
+    pub(super) fn peek_action(&mut self) -> Option<SyncAction> {
         if let Some(action) = &self.peeked {
             return Some(action.clone());
         }
@@ -119,18 +114,18 @@ pub(crate) enum SyncAction {
         timestamp: u64,
         l1_gas_price: u64,
         l2_fair_gas_price: u64,
+        fair_pubdata_price: Option<u64>,
         operator_address: Address,
         protocol_version: ProtocolVersionId,
         // Miniblock number and virtual blocks count.
         first_miniblock_info: (MiniblockNumber, u32),
-        prev_miniblock_hash: H256,
     },
     Miniblock {
         number: MiniblockNumber,
         timestamp: u64,
         virtual_blocks: u32,
     },
-    Tx(Box<Transaction>),
+    Tx(Box<FetchedTransaction>),
     /// We need an explicit action for the miniblock sealing, since we fetch the whole miniblocks and already know
     /// that they are sealed, but at the same time the next miniblock may not exist yet.
     /// By having a dedicated action for that we prevent a situation where the miniblock is kept open on the EN until
@@ -138,13 +133,13 @@ pub(crate) enum SyncAction {
     SealMiniblock,
     /// Similarly to `SealMiniblock` we must be able to seal the batch even if there is no next miniblock yet.
     SealBatch {
-        // Virtual blocks count for the fictive miniblock.
+        /// Virtual blocks count for the fictive miniblock.
         virtual_blocks: u32,
     },
 }
 
-impl From<Transaction> for SyncAction {
-    fn from(tx: Transaction) -> Self {
+impl From<FetchedTransaction> for SyncAction {
+    fn from(tx: FetchedTransaction) -> Self {
         Self::Tx(Box::new(tx))
     }
 }
@@ -161,10 +156,10 @@ mod tests {
             timestamp: 1,
             l1_gas_price: 1,
             l2_fair_gas_price: 1,
+            fair_pubdata_price: Some(1),
             operator_address: Default::default(),
             protocol_version: ProtocolVersionId::latest(),
             first_miniblock_info: (1.into(), 1),
-            prev_miniblock_hash: H256::default(),
         }
     }
 
@@ -189,7 +184,7 @@ mod tests {
         );
         tx.set_input(H256::default().0.to_vec(), H256::default());
 
-        SyncAction::Tx(Box::new(tx.into()))
+        FetchedTransaction::new(tx.into()).into()
     }
 
     fn seal_miniblock() -> SyncAction {
@@ -232,7 +227,7 @@ mod tests {
             // Unexpected tx
             (vec![tx()], "Unexpected Tx"),
             (vec![open_batch(), seal_miniblock(), tx()], "Unexpected Tx"),
-            // Unexpected OpenBatch/Miniblock
+            // Unexpected `OpenBatch/Miniblock`
             (
                 vec![miniblock(), miniblock()],
                 "Unexpected OpenBatch/Miniblock",
@@ -245,7 +240,7 @@ mod tests {
                 vec![open_batch(), miniblock()],
                 "Unexpected OpenBatch/Miniblock",
             ),
-            // Unexpected SealMiniblock
+            // Unexpected `SealMiniblock`
             (vec![seal_miniblock()], "Unexpected SealMiniblock"),
             (
                 vec![miniblock(), seal_miniblock(), seal_miniblock()],

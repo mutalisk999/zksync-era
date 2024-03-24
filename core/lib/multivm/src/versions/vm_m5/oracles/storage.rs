@@ -1,29 +1,26 @@
 use std::collections::HashMap;
 
-use crate::vm_m5::glue::GlueInto;
-use crate::vm_m5::storage::{Storage, StoragePtr};
-
-use crate::vm_m5::history_recorder::{
-    AppDataFrameManagerWithHistory, HashMapHistoryEvent, HistoryRecorder, StorageWrapper,
-};
-use crate::vm_m5::vm::MultiVMSubversion;
-
-use zk_evm_1_3_1::abstractions::RefundedAmounts;
-use zk_evm_1_3_1::zkevm_opcode_defs::system_params::INITIAL_STORAGE_WRITE_PUBDATA_BYTES;
 use zk_evm_1_3_1::{
-    abstractions::{RefundType, Storage as VmStorageOracle},
+    abstractions::{RefundType, RefundedAmounts, Storage as VmStorageOracle},
     aux_structures::{LogQuery, Timestamp},
     reference_impls::event_sink::ApplicationData,
+    zkevm_opcode_defs::system_params::INITIAL_STORAGE_WRITE_PUBDATA_BYTES,
 };
-
-use zksync_types::utils::storage_key_for_eth_balance;
 use zksync_types::{
-    AccountTreeId, Address, StorageKey, StorageLogQuery, StorageLogQueryType, BOOTLOADER_ADDRESS,
-    U256,
+    utils::storage_key_for_eth_balance, AccountTreeId, Address, StorageKey, StorageLogQueryType,
+    BOOTLOADER_ADDRESS, U256,
 };
 use zksync_utils::u256_to_h256;
 
 use super::OracleWithHistory;
+use crate::vm_m5::{
+    history_recorder::{
+        AppDataFrameManagerWithHistory, HashMapHistoryEvent, HistoryRecorder, StorageWrapper,
+    },
+    storage::{Storage, StoragePtr},
+    utils::StorageLogQuery,
+    vm_instance::MultiVMSubversion,
+};
 
 // While the storage does not support different shards, it was decided to write the
 // code of the StorageOracle with the shard parameters in mind.
@@ -96,7 +93,7 @@ impl<S: Storage> StorageOracle<S> {
 
         self.frames_stack.push_forward(
             StorageLogQuery {
-                log_query: query.glue_into(),
+                log_query: query,
                 log_type: StorageLogQueryType::Read,
             },
             query.timestamp,
@@ -120,7 +117,7 @@ impl<S: Storage> StorageOracle<S> {
         query.read_value = current_value;
 
         let mut storage_log_query = StorageLogQuery {
-            log_query: query.glue_into(),
+            log_query: query,
             log_type: log_query_type,
         };
         self.frames_stack
@@ -184,6 +181,7 @@ impl<S: Storage> VmStorageOracle for StorageOracle<S> {
         _monotonic_cycle_counter: u32,
         query: LogQuery,
     ) -> LogQuery {
+        // ```
         // tracing::trace!(
         //     "execute partial query cyc {:?} addr {:?} key {:?}, rw {:?}, wr {:?}, tx {:?}",
         //     _monotonic_cycle_counter,
@@ -193,6 +191,7 @@ impl<S: Storage> VmStorageOracle for StorageOracle<S> {
         //     query.written_value,
         //     query.tx_number_in_block
         // );
+        // ```
         assert!(!query.rollback);
         if query.rw_flag {
             // The number of bytes that have been compensated by the user to perform this write
@@ -261,7 +260,7 @@ impl<S: Storage> VmStorageOracle for StorageOracle<S> {
                     }
                 };
 
-                let LogQuery { written_value, .. } = query.log_query.glue_into();
+                let LogQuery { written_value, .. } = query.log_query;
                 let key = triplet_to_storage_key(
                     query.log_query.shard_id,
                     query.log_query.address,
@@ -275,7 +274,7 @@ impl<S: Storage> VmStorageOracle for StorageOracle<S> {
                 );
 
                 // Additional validation that the current value was correct
-                // Unwrap is safe because the return value from write_inner is the previous value in this leaf.
+                // Unwrap is safe because the return value from `write_inner` is the previous value in this leaf.
                 // It is impossible to set leaf value to `None`
                 assert_eq!(current_value, written_value);
             }

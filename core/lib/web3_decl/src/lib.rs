@@ -15,6 +15,3 @@ pub mod namespaces;
 pub mod types;
 
 pub use jsonrpsee;
-use jsonrpsee::core::Error;
-
-pub type RpcResult<T> = Result<T, Error>;

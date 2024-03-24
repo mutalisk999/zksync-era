@@ -5,68 +5,62 @@
 
 #![allow(clippy::upper_case_acronyms, clippy::derive_partial_eq_without_eq)]
 
-use fee::encoding_len;
-use serde::{Deserialize, Serialize};
 use std::{fmt, fmt::Debug};
 
+pub use event::{VmEvent, VmEventGroupKey};
+use fee::encoding_len;
+pub use l1::L1TxCommonData;
+pub use l2::L2TxCommonData;
+pub use protocol_upgrade::{ProtocolUpgrade, ProtocolVersion};
+use serde::{Deserialize, Serialize};
+pub use storage::*;
+pub use tx::{primitives::*, Execute};
+pub use zksync_basic_types::{protocol_version::ProtocolVersionId, vm_version::VmVersion, *};
+
+use crate::{l2::TransactionType, protocol_upgrade::ProtocolUpgradeTxCommonData};
 pub use crate::{Nonce, H256, U256, U64};
 
 pub type SerialId = u64;
-
-use crate::l2::TransactionType;
-use crate::protocol_version::ProtocolUpgradeTxCommonData;
-pub use event::{VmEvent, VmEventGroupKey};
-pub use l1::L1TxCommonData;
-pub use l2::L2TxCommonData;
-pub use protocol_version::{ProtocolUpgrade, ProtocolVersion, ProtocolVersionId};
-pub use storage::*;
-pub use tx::primitives::*;
-pub use tx::Execute;
-pub use vm_version::VmVersion;
-pub use zk_evm::{
-    aux_structures::{LogQuery, Timestamp},
-    reference_impls::event_sink::EventMessage,
-    zkevm_opcode_defs::FarCallOpcode,
-};
-
-pub use zkevm_test_harness;
-pub use zksync_basic_types::*;
 
 pub mod aggregated_operations;
 pub mod block;
 pub mod circuit;
 pub mod commitment;
 pub mod contract_verification_api;
-pub mod contracts;
+pub mod debug_flat_call;
 pub mod event;
 pub mod fee;
+pub mod fee_model;
 pub mod l1;
 pub mod l2;
 pub mod l2_to_l1_log;
 pub mod priority_op_onchain_data;
-pub mod protocol_version;
+pub mod protocol_upgrade;
+pub mod pubdata_da;
+pub mod snapshots;
 pub mod storage;
 pub mod storage_writes_deduplicator;
 pub mod system_contracts;
 pub mod tokens;
 pub mod tx;
 pub mod vm_trace;
+pub mod zk_evm_types;
 
 pub mod api;
 pub mod eth_sender;
 pub mod helpers;
-pub mod proofs;
-pub mod prover_server_api;
+pub mod proto;
 pub mod transaction_request;
 pub mod utils;
-pub mod vk_transform;
-pub mod vm_version;
 
 /// Denotes the first byte of the special zkSync's EIP-712-signed transaction.
 pub const EIP_712_TX_TYPE: u8 = 0x71;
 
 /// Denotes the first byte of the `EIP-1559` transaction.
 pub const EIP_1559_TX_TYPE: u8 = 0x02;
+
+/// Denotes the first byte of the `EIP-4844` transaction.
+pub const EIP_4844_TX_TYPE: u8 = 0x03;
 
 /// Denotes the first byte of the `EIP-2930` transaction.
 pub const EIP_2930_TX_TYPE: u8 = 0x01;
@@ -223,7 +217,7 @@ pub struct InputData {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExecuteTransactionCommon {
     L1(L1TxCommonData),
     L2(L2TxCommonData),

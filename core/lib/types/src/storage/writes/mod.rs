@@ -1,16 +1,20 @@
 use std::convert::TryInto;
 
-use crate::H256;
 use serde::{Deserialize, Serialize};
 use zksync_basic_types::{Address, U256};
 
-use self::compression::{compress_with_best_strategy, COMPRESSION_VERSION_NUMBER};
+pub(crate) use self::compression::{compress_with_best_strategy, COMPRESSION_VERSION_NUMBER};
+use crate::H256;
 
-mod compression;
+pub mod compression;
 
-const BYTES_PER_ENUMERATION_INDEX: u8 = 4;
-// Total byte size of all fields in StateDiffRecord struct
-// 20 + 32 + 32 +8 + 32 + 32
+/// The number of bytes being used for state diff enumeration indices. Applicable to repeated writes.
+pub const BYTES_PER_ENUMERATION_INDEX: u8 = 4;
+/// The number of bytes being used for state diff derived keys. Applicable to initial writes.
+pub const BYTES_PER_DERIVED_KEY: u8 = 32;
+
+/// Total byte size of all fields in StateDiffRecord struct
+/// 20 + 32 + 32 + 8 + 32 + 32
 const STATE_DIFF_RECORD_SIZE: usize = 156;
 
 // 2 * 136 - the size that allows for two keccak rounds.
@@ -21,6 +25,7 @@ pub const PADDED_ENCODED_STORAGE_DIFF_LEN_BYTES: usize = 272;
 /// It allows us to compress the data, as the full key would use 32 bytes, and the index can be
 /// represented only as BYTES_PER_ENUMERATION_INDEX bytes
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(test, derive(Serialize, Deserialize))]
 pub struct InitialStorageWrite {
     pub index: u64,
     pub key: U256,
@@ -29,7 +34,8 @@ pub struct InitialStorageWrite {
 
 /// For repeated writes, we can substitute the 32 byte key for a BYTES_PER_ENUMERATION_INDEX byte index
 /// representing its leaf index in the tree.
-#[derive(Clone, Debug, Deserialize, Serialize, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(test, derive(Serialize, Deserialize))]
 pub struct RepeatedStorageWrite {
     pub index: u64,
     pub value: H256,
@@ -37,7 +43,7 @@ pub struct RepeatedStorageWrite {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Eq, PartialEq)]
 pub struct StateDiffRecord {
-    /// address state diff occured at
+    /// address state diff occurred at
     pub address: Address,
     /// storage slot key updated
     pub key: U256,
@@ -111,7 +117,7 @@ impl StateDiffRecord {
         }
     }
 
-    /// compression follows the following algo:
+    /// compression follows the following algorithm:
     /// 1. if repeated write:
     ///      entry <- enumeration_index || compressed value
     /// 2. if initial write:
@@ -180,12 +186,13 @@ fn prepend_header(compressed_state_diffs: Vec<u8>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::{Add, Sub};
-    use std::str::FromStr;
+    use std::{
+        ops::{Add, Sub},
+        str::FromStr,
+    };
 
     use super::*;
-    use crate::commitment::serialize_commitments;
-    use crate::{H256, U256};
+    use crate::{commitment::serialize_commitments, H256, U256};
 
     #[test]
     fn calculate_hash_for_storage_writes() {
@@ -203,8 +210,7 @@ mod tests {
         ];
         let bytes = serialize_commitments(&initial_writes);
 
-        let expected_bytes = "00000002\
-            0100000000000000000000000000000000000000000000000000000000000000\
+        let expected_bytes = "0100000000000000000000000000000000000000000000000000000000000000\
             0101010101010101010101010101010101010101010101010101010101010101\
             0200000000000000000000000000000000000000000000000000000000000000\
             0303030303030303030303030303030303030303030303030303030303030303";
@@ -223,8 +229,7 @@ mod tests {
         ];
         let bytes = serialize_commitments(&repeated_writes);
 
-        let expected_bytes = "00000002\
-            0000000000000001\
+        let expected_bytes = "0000000000000001\
             0101010101010101010101010101010101010101010101010101010101010101\
             0000000000000002\
             0303030303030303030303030303030303030303030303030303030303030303";

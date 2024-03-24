@@ -1,24 +1,20 @@
-use anyhow::Context;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
-use zksync_dal::ConnectionPool;
+use anyhow::Context;
+use async_trait::async_trait;
+use multivm::interface::{L2BlockEnv, VmInterface};
+use tokio::{runtime::Handle, task::JoinHandle};
+use vm_utils::{create_vm, execute_tx};
+use zksync_dal::{
+    basic_witness_input_producer_dal::JOB_MAX_ATTEMPT, ConnectionPool, Core, CoreDal,
+};
 use zksync_object_store::{ObjectStore, ObjectStoreFactory};
 use zksync_queued_job_processor::JobProcessor;
-use zksync_types::witness_block_state::WitnessBlockState;
-use zksync_types::{L1BatchNumber, L2ChainId};
-
-use async_trait::async_trait;
-use multivm::interface::L2BlockEnv;
-use tokio::runtime::Handle;
-use tokio::task::JoinHandle;
-
-mod metrics;
-mod vm_interactions;
+use zksync_types::{witness_block_state::WitnessBlockState, L1BatchNumber, L2ChainId};
 
 use self::metrics::METRICS;
-use self::vm_interactions::{create_vm, execute_tx};
 
+mod metrics;
 /// Component that extracts all data (from DB) necessary to run a Basic Witness Generator.
 /// Does this by rerunning an entire L1Batch and extracting information from both the VM run and DB.
 /// This component will upload Witness Inputs to the object store.
@@ -26,20 +22,20 @@ use self::vm_interactions::{create_vm, execute_tx};
 /// to be run only using the object store information, having no other external dependency.
 #[derive(Debug)]
 pub struct BasicWitnessInputProducer {
-    connection_pool: ConnectionPool,
+    connection_pool: ConnectionPool<Core>,
     l2_chain_id: L2ChainId,
     object_store: Arc<dyn ObjectStore>,
 }
 
 impl BasicWitnessInputProducer {
     pub async fn new(
-        connection_pool: ConnectionPool,
+        connection_pool: ConnectionPool<Core>,
         store_factory: &ObjectStoreFactory,
         l2_chain_id: L2ChainId,
     ) -> anyhow::Result<Self> {
         Ok(BasicWitnessInputProducer {
             connection_pool,
-            object_store: store_factory.create_store().await.into(),
+            object_store: store_factory.create_store().await,
             l2_chain_id,
         })
     }
@@ -48,11 +44,11 @@ impl BasicWitnessInputProducer {
         rt_handle: Handle,
         l1_batch_number: L1BatchNumber,
         started_at: Instant,
-        connection_pool: ConnectionPool,
+        connection_pool: ConnectionPool<Core>,
         l2_chain_id: L2ChainId,
     ) -> anyhow::Result<WitnessBlockState> {
         let mut connection = rt_handle
-            .block_on(connection_pool.access_storage())
+            .block_on(connection_pool.connection())
             .context("failed to get connection for BasicWitnessInputProducer")?;
 
         let miniblocks_execution_data = rt_handle.block_on(
@@ -118,7 +114,7 @@ impl JobProcessor for BasicWitnessInputProducer {
     const SERVICE_NAME: &'static str = "basic_witness_input_producer";
 
     async fn get_next_job(&self) -> anyhow::Result<Option<(Self::JobId, Self::Job)>> {
-        let mut connection = self.connection_pool.access_storage().await?;
+        let mut connection = self.connection_pool.connection().await?;
         let l1_batch_to_process = connection
             .basic_witness_input_producer_dal()
             .get_next_basic_witness_input_producer_job()
@@ -130,7 +126,7 @@ impl JobProcessor for BasicWitnessInputProducer {
     async fn save_failure(&self, job_id: Self::JobId, started_at: Instant, error: String) {
         let attempts = self
             .connection_pool
-            .access_storage()
+            .connection()
             .await
             .unwrap()
             .basic_witness_input_producer_dal()
@@ -180,15 +176,41 @@ impl JobProcessor for BasicWitnessInputProducer {
             .observe(upload_started_at.elapsed());
         let mut connection = self
             .connection_pool
-            .access_storage()
+            .connection()
             .await
             .context("failed to acquire DB connection for BasicWitnessInputProducer")?;
-        connection
+        let mut transaction = connection
+            .start_transaction()
+            .await
+            .context("failed to acquire DB transaction for BasicWitnessInputProducer")?;
+        transaction
             .basic_witness_input_producer_dal()
             .mark_job_as_successful(job_id, started_at, &object_path)
             .await
             .context("failed to mark job as successful for BasicWitnessInputProducer")?;
+        transaction
+            .commit()
+            .await
+            .context("failed to commit DB transaction for BasicWitnessInputProducer")?;
         METRICS.block_number_processed.set(job_id.0 as i64);
         Ok(())
+    }
+
+    fn max_attempts(&self) -> u32 {
+        JOB_MAX_ATTEMPT as u32
+    }
+
+    async fn get_job_attempts(&self, job_id: &L1BatchNumber) -> anyhow::Result<u32> {
+        let mut connection = self
+            .connection_pool
+            .connection()
+            .await
+            .context("failed to acquire DB connection for BasicWitnessInputProducer")?;
+        connection
+            .basic_witness_input_producer_dal()
+            .get_basic_witness_input_producer_job_attempts(*job_id)
+            .await
+            .map(|attempts| attempts.unwrap_or(0))
+            .context("failed to get job attempts for BasicWitnessInputProducer")
     }
 }

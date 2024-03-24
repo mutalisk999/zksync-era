@@ -1,13 +1,15 @@
-use crate::error::{RpcSignerError, SignerError};
-use crate::json_rpc_signer::messages::JsonRpcRequest;
-use crate::raw_ethereum_tx::TransactionParameters;
-use crate::EthereumSigner;
-
 use jsonrpc_core::types::response::Output;
-use zksync_types::tx::primitives::PackedEthSignature;
-use zksync_types::{Address, EIP712TypedStructure, Eip712Domain, H256};
-
 use serde_json::Value;
+use zksync_types::{
+    tx::primitives::PackedEthSignature, Address, EIP712TypedStructure, Eip712Domain, H256,
+};
+
+use crate::{
+    error::{RpcSignerError, SignerError},
+    json_rpc_signer::messages::JsonRpcRequest,
+    raw_ethereum_tx::TransactionParameters,
+    EthereumSigner,
+};
 
 pub fn is_signature_from_address(
     signature: &PackedEthSignature,
@@ -27,65 +29,16 @@ pub enum AddressOrIndex {
     Index(usize),
 }
 
-/// Describes whether to add a prefix `\x19Ethereum Signed Message:\n`
-/// when requesting a message signature.
-#[derive(Debug, Clone)]
-pub enum SignerType {
-    NotNeedPrefix,
-    NeedPrefix,
-}
-
 #[derive(Debug, Clone)]
 pub struct JsonRpcSigner {
     rpc_addr: String,
     client: reqwest::Client,
     address: Option<Address>,
-    signer_type: Option<SignerType>,
 }
 
 #[async_trait::async_trait]
 impl EthereumSigner for JsonRpcSigner {
-    /// The sign method calculates an Ethereum specific signature with:
-    /// checks if the server adds a prefix if not then adds
-    /// return sign(keccak256("\x19Ethereum Signed Message:\n" + len(message) + message))).
-    async fn sign_message(&self, msg: &[u8]) -> Result<PackedEthSignature, SignerError> {
-        let signature: PackedEthSignature = {
-            let msg = match &self.signer_type {
-                Some(SignerType::NotNeedPrefix) => msg.to_vec(),
-                Some(SignerType::NeedPrefix) => {
-                    let prefix = format!("\x19Ethereum Signed Message:\n{}", msg.len());
-                    let mut bytes = Vec::with_capacity(prefix.len() + msg.len());
-                    bytes.extend_from_slice(prefix.as_bytes());
-                    bytes.extend_from_slice(msg);
-
-                    bytes
-                }
-                None => {
-                    return Err(SignerError::MissingEthSigner);
-                }
-            };
-
-            let message = JsonRpcRequest::sign_message(self.address()?, &msg);
-            let ret = self
-                .post(&message)
-                .await
-                .map_err(|err| SignerError::SigningFailed(err.to_string()))?;
-            serde_json::from_value(ret)
-                .map_err(|err| SignerError::SigningFailed(err.to_string()))?
-        };
-
-        let signed_bytes = PackedEthSignature::message_to_signed_bytes(msg);
-        // Checks the correctness of the message signature without a prefix
-        if is_signature_from_address(&signature, &signed_bytes, self.address()?)? {
-            Ok(signature)
-        } else {
-            Err(SignerError::SigningFailed(
-                "Invalid signature from JsonRpcSigner".to_string(),
-            ))
-        }
-    }
-
-    /// Signs typed struct using ethereum private key by EIP-712 signature standard.
+    /// Signs typed struct using Ethereum private key by EIP-712 signature standard.
     /// Result of this function is the equivalent of RPC calling `eth_signTypedData`.
     async fn sign_typed_data<S: EIP712TypedStructure + Sync>(
         &self,
@@ -152,14 +105,12 @@ impl JsonRpcSigner {
     pub async fn new(
         rpc_addr: impl Into<String>,
         address_or_index: Option<AddressOrIndex>,
-        signer_type: Option<SignerType>,
         password_to_unlock: Option<String>,
     ) -> Result<Self, SignerError> {
         let mut signer = Self {
             rpc_addr: rpc_addr.into(),
             client: reqwest::Client::new(),
             address: None,
-            signer_type,
         };
 
         // If the user has not specified either the index or the address,
@@ -169,7 +120,7 @@ impl JsonRpcSigner {
             None => AddressOrIndex::Index(0),
         };
 
-        // EthereumSigner can support many different addresses,
+        // `EthereumSigner` can support many different addresses,
         // we define only the one we need by the index
         // of receiving from the server or by the address itself.
         signer.detect_address(address_or_index).await?;
@@ -177,12 +128,6 @@ impl JsonRpcSigner {
         if let Some(password) = password_to_unlock {
             signer.unlock(&password).await?;
         }
-
-        // If it is not known whether it is necessary
-        // to add a prefix to messages, then we define this.
-        if signer.signer_type.is_none() {
-            signer.detect_signer_type().await?;
-        };
 
         Ok(signer)
     }
@@ -192,7 +137,7 @@ impl JsonRpcSigner {
         self.address.ok_or(SignerError::DefineAddress)
     }
 
-    /// Specifies the Ethreum address which sets the address for which all other requests will be processed.
+    /// Specifies the Ethereum address which sets the address for which all other requests will be processed.
     /// If the address has already been set, then it will all the same change to a new one.
     pub async fn detect_address(
         &mut self,
@@ -213,47 +158,6 @@ impl JsonRpcSigner {
         };
 
         self.address.ok_or(SignerError::DefineAddress)
-    }
-
-    /// Server can either add the prefix `\x19Ethereum Signed Message:\n` to the message and not add.
-    /// Checks if a prefix should be added to the message.
-    pub async fn detect_signer_type(&mut self) -> Result<(), SignerError> {
-        // If the `sig_type` is set, then we do not need to detect it from the server.
-        if self.signer_type.is_some() {
-            return Ok(());
-        }
-
-        let msg = "JsonRpcSigner type was not specified. Sign this message to detect the signer type. It only has to be done once per session";
-        let msg_with_prefix = format!("\x19Ethereum Signed Message:\n{}{}", msg.len(), msg);
-
-        let signature: PackedEthSignature = {
-            let message = JsonRpcRequest::sign_message(self.address()?, msg.as_bytes());
-
-            let ret = self
-                .post(&message)
-                .await
-                .map_err(|err| SignerError::SigningFailed(err.to_string()))?;
-            serde_json::from_value(ret)
-                .map_err(|err| SignerError::SigningFailed(err.to_string()))?
-        };
-
-        let msg_signed_bytes = PackedEthSignature::message_to_signed_bytes(msg.as_bytes());
-        if is_signature_from_address(&signature, &msg_signed_bytes, self.address()?)? {
-            self.signer_type = Some(SignerType::NotNeedPrefix);
-        }
-
-        let msg_with_prefix_signed_bytes =
-            PackedEthSignature::message_to_signed_bytes(msg_with_prefix.as_bytes());
-        if is_signature_from_address(&signature, &msg_with_prefix_signed_bytes, self.address()?)? {
-            self.signer_type = Some(SignerType::NeedPrefix);
-        }
-
-        match self.signer_type.is_some() {
-            true => Ok(()),
-            false => Err(SignerError::SigningFailed(
-                "Failed to get the correct signature".to_string(),
-            )),
-        }
     }
 
     /// Unlocks the current account, after that the server can sign messages and transactions.
@@ -325,12 +229,13 @@ impl JsonRpcSigner {
 }
 
 mod messages {
-    use crate::raw_ethereum_tx::TransactionParameters;
     use hex::encode;
     use serde::{Deserialize, Serialize};
     use zksync_types::{
         eip712_signature::utils::get_eip712_json, Address, EIP712TypedStructure, Eip712Domain,
     };
+
+    use crate::raw_ethereum_tx::TransactionParameters;
 
     #[derive(Debug, Serialize, Deserialize)]
     pub struct JsonRpcRequest {
@@ -365,18 +270,7 @@ mod messages {
             Self::create("personal_unlockAccount", params)
         }
 
-        /// The sign method calculates an Ethereum specific signature with:
-        /// sign(keccak256("\x19Ethereum Signed Message:\n" + len(message) + message))).
-        /// The address to sign with must be unlocked.
-        pub fn sign_message(address: Address, message: &[u8]) -> Self {
-            let params = vec![
-                serde_json::to_value(address).expect("serialization fail"),
-                serde_json::to_value(format!("0x{}", encode(message))).expect("serialization fail"),
-            ];
-            Self::create("eth_sign", params)
-        }
-
-        /// Signs typed struct using ethereum private key by EIP-712 signature standard.
+        /// Signs typed struct using Ethereum private key by EIP-712 signature standard.
         /// The address to sign with must be unlocked.
         pub fn sign_typed_data<S: EIP712TypedStructure + Sync>(
             address: Address,
@@ -429,43 +323,36 @@ mod messages {
 
 #[cfg(test)]
 mod tests {
-    use crate::raw_ethereum_tx::TransactionParameters;
-    use actix_web::{
-        post,
-        web::{self, Data},
-        App, HttpResponse, HttpServer, Responder,
+    use std::{future::IntoFuture, sync::Arc};
+
+    use axum::{
+        extract::{Json, State},
+        routing::post,
+        Router,
     };
     use futures::future::{AbortHandle, Abortable};
     use jsonrpc_core::{Failure, Id, Output, Success, Version};
-    use parity_crypto::publickey::{Generator, KeyPair, Random};
     use serde_json::json;
+    use zksync_types::{tx::primitives::PackedEthSignature, H256};
 
-    use zksync_types::{tx::primitives::PackedEthSignature, Address};
+    use super::messages::JsonRpcRequest;
+    use crate::{raw_ethereum_tx::TransactionParameters, EthereumSigner, JsonRpcSigner};
 
-    use super::{is_signature_from_address, messages::JsonRpcRequest};
-    use crate::{EthereumSigner, JsonRpcSigner};
-
-    #[post("/")]
-    async fn index(req: web::Json<JsonRpcRequest>, state: web::Data<State>) -> impl Responder {
+    async fn index(
+        State(state): State<Arc<ServerState>>,
+        Json(req): Json<JsonRpcRequest>,
+    ) -> Json<serde_json::Value> {
         let resp = match req.method.as_str() {
             "eth_accounts" => {
                 let mut addresses = vec![];
-                for pair in &state.key_pairs {
-                    addresses.push(pair.address())
+                for pk in &state.private_keys {
+                    let address = PackedEthSignature::address_from_private_key(pk).unwrap();
+                    addresses.push(address)
                 }
 
                 create_success(json!(addresses))
             }
             "personal_unlockAccount" => create_success(json!(true)),
-            "eth_sign" => {
-                let _address: Address = serde_json::from_value(req.params[0].clone()).unwrap();
-                let data: String = serde_json::from_value(req.params[1].clone()).unwrap();
-                let data_bytes = hex::decode(&data[2..]).unwrap();
-                let signature =
-                    PackedEthSignature::sign(&state.key_pairs[0].secret().0.into(), &data_bytes)
-                        .unwrap();
-                create_success(json!(signature))
-            }
             "eth_signTransaction" => {
                 let tx_value = json!(req.params[0].clone()).to_string();
                 let tx = tx_value.as_bytes();
@@ -474,7 +361,7 @@ mod tests {
             }
             _ => create_fail(req.method.clone()),
         };
-        HttpResponse::Ok().json(json!(resp))
+        Json(json!(resp))
     }
 
     fn create_fail(method: String) -> Output {
@@ -497,25 +384,21 @@ mod tests {
         })
     }
     #[derive(Clone)]
-    struct State {
-        key_pairs: Vec<KeyPair>,
+    struct ServerState {
+        private_keys: Vec<H256>,
     }
 
-    fn run_server(state: State) -> (String, AbortHandle) {
+    async fn run_server(state: ServerState) -> (String, AbortHandle) {
         let mut url = None;
         let mut server = None;
+        let app = Router::new()
+            .route("/", post(index))
+            .with_state(Arc::new(state));
+
         for i in 9000..9999 {
             let new_url = format!("127.0.0.1:{}", i);
-            // Try to bind to some port, hope that 999 variants will be enough
-            let tmp_state = state.clone();
-            if let Ok(ser) = HttpServer::new(move || {
-                App::new()
-                    .app_data(Data::new(tmp_state.clone()))
-                    .service(index)
-            })
-            .bind(new_url.clone())
-            {
-                server = Some(ser);
+            if let Ok(listener) = tokio::net::TcpListener::bind(&new_url).await {
+                server = Some(axum::serve(listener, app));
                 url = Some(new_url);
                 break;
             }
@@ -523,27 +406,20 @@ mod tests {
 
         let server = server.expect("Could not bind to port from 9000 to 9999");
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
-        let future = Abortable::new(server.run(), abort_registration);
+        let future = Abortable::new(server.into_future(), abort_registration);
         tokio::spawn(future);
         let address = format!("http://{}/", &url.unwrap());
         (address, abort_handle)
     }
 
-    #[actix_rt::test]
+    #[tokio::test]
     async fn run_client() {
-        let (address, abort_handle) = run_server(State {
-            key_pairs: vec![Random.generate()],
-        });
+        let (address, abort_handle) = run_server(ServerState {
+            private_keys: vec![H256::repeat_byte(0x17)],
+        })
+        .await;
         // Get address is ok,  unlock address is ok, recover address from signature is also ok
-        let client = JsonRpcSigner::new(address, None, None, None).await.unwrap();
-        let msg = b"some_text_message";
-
-        let signature = client.sign_message(msg).await.unwrap();
-        let signed_bytes = PackedEthSignature::message_to_signed_bytes(msg);
-        assert!(
-            is_signature_from_address(&signature, &signed_bytes, client.address().unwrap())
-                .unwrap()
-        );
+        let client = JsonRpcSigner::new(address, None, None).await.unwrap();
 
         let transaction_signature = client
             .sign_transaction(TransactionParameters::default())

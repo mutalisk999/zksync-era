@@ -1,34 +1,38 @@
-use axum::extract::Path;
-use axum::response::Response;
-use axum::{http::StatusCode, response::IntoResponse, Json};
-use std::convert::TryFrom;
-use std::sync::Arc;
+use std::{convert::TryFrom, sync::Arc};
+
+use axum::{
+    extract::Path,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use zksync_config::configs::{
     proof_data_handler::ProtocolVersionLoadingMode, ProofDataHandlerConfig,
 };
-
-use zksync_dal::{ConnectionPool, SqlxError};
+use zksync_dal::{ConnectionPool, Core, CoreDal, SqlxError};
 use zksync_object_store::{ObjectStore, ObjectStoreError};
-use zksync_types::protocol_version::FriProtocolVersionId;
-use zksync_types::{
-    protocol_version::L1VerifierConfig,
-    prover_server_api::{
-        ProofGenerationData, ProofGenerationDataRequest, ProofGenerationDataResponse,
-        SubmitProofRequest, SubmitProofResponse,
-    },
-    L1BatchNumber,
+use zksync_prover_interface::api::{
+    ProofGenerationData, ProofGenerationDataRequest, ProofGenerationDataResponse,
+    SubmitProofRequest, SubmitProofResponse,
 };
+use zksync_types::{
+    basic_fri_types::Eip4844Blobs,
+    commitment::serialize_commitments,
+    protocol_version::{FriProtocolVersionId, L1VerifierConfig},
+    web3::signing::keccak256,
+    L1BatchNumber, H256,
+};
+use zksync_utils::u256_to_h256;
 
 #[derive(Clone)]
 pub(crate) struct RequestProcessor {
     blob_store: Arc<dyn ObjectStore>,
-    pool: ConnectionPool,
+    pool: ConnectionPool<Core>,
     config: ProofDataHandlerConfig,
     l1_verifier_config: Option<L1VerifierConfig>,
 }
 
 pub(crate) enum RequestProcessorError {
-    NoPendingBatches,
     ObjectStore(ObjectStoreError),
     Sqlx(SqlxError),
 }
@@ -36,10 +40,6 @@ pub(crate) enum RequestProcessorError {
 impl IntoResponse for RequestProcessorError {
     fn into_response(self) -> Response {
         let (status_code, message) = match self {
-            Self::NoPendingBatches => (
-                StatusCode::NOT_FOUND,
-                "No pending batches to process".to_owned(),
-            ),
             RequestProcessorError::ObjectStore(err) => {
                 tracing::error!("GCS error: {:?}", err);
                 (
@@ -66,13 +66,13 @@ impl IntoResponse for RequestProcessorError {
 
 impl RequestProcessor {
     pub(crate) fn new(
-        blob_store: Box<dyn ObjectStore>,
-        pool: ConnectionPool,
+        blob_store: Arc<dyn ObjectStore>,
+        pool: ConnectionPool<Core>,
         config: ProofDataHandlerConfig,
         l1_verifier_config: Option<L1VerifierConfig>,
     ) -> Self {
         Self {
-            blob_store: Arc::from(blob_store),
+            blob_store,
             pool,
             config,
             l1_verifier_config,
@@ -85,15 +85,19 @@ impl RequestProcessor {
     ) -> Result<Json<ProofGenerationDataResponse>, RequestProcessorError> {
         tracing::info!("Received request for proof generation data: {:?}", request);
 
-        let l1_batch_number = self
+        let l1_batch_number_result = self
             .pool
-            .access_storage()
+            .connection()
             .await
             .unwrap()
             .proof_generation_dal()
             .get_next_block_to_be_proven(self.config.proof_generation_timeout())
-            .await
-            .ok_or(RequestProcessorError::NoPendingBatches)?;
+            .await;
+
+        let l1_batch_number = match l1_batch_number_result {
+            Some(number) => number,
+            None => return Ok(Json(ProofGenerationDataResponse::Success(None))), // no batches pending to be proven
+        };
 
         let blob = self
             .blob_store
@@ -101,28 +105,73 @@ impl RequestProcessor {
             .await
             .map_err(RequestProcessorError::ObjectStore)?;
 
-        let fri_protocol_version_id =
-            FriProtocolVersionId::try_from(self.config.fri_protocol_version_id)
-                .expect("Invalid FRI protocol version id");
-
-        let l1_verifier_config= match self.config.protocol_version_loading_mode {
+        let (l1_verifier_config, fri_protocol_version_id) = match self.config.protocol_version_loading_mode {
             ProtocolVersionLoadingMode::FromDb => {
-                panic!("Loading protocol version from db is not implemented yet")
+
+                let header = self
+                .pool
+                .connection()
+                .await
+                .unwrap()
+                .blocks_dal()
+                .get_l1_batch_header(l1_batch_number)
+                .await
+                .unwrap()
+                .expect(&format!("Missing header for {}", l1_batch_number));
+
+            let protocol_version = header.protocol_version.unwrap();
+            // TODO: What invariants have to hold such that protocol version = fri protocol version?
+            let fri_protocol_version = FriProtocolVersionId::from(protocol_version);
+            (self
+                .pool
+                .connection()
+                .await
+                .unwrap()
+                .protocol_versions_dal()
+                .l1_verifier_config_for_version(protocol_version)
+                .await
+                .expect(&format!(
+                    "Missing l1 verifier info for protocol version {protocol_version:?}",
+                )), fri_protocol_version)
+
             }
             ProtocolVersionLoadingMode::FromEnvVar => {
-                self.l1_verifier_config
-                    .expect("l1_verifier_config must be set while running ProtocolVersionLoadingMode::FromEnvVar mode")
+                (self.l1_verifier_config
+                    .expect("l1_verifier_config must be set while running ProtocolVersionLoadingMode::FromEnvVar mode"),
+                    FriProtocolVersionId::try_from(self.config.fri_protocol_version_id)
+                .expect("Invalid FRI protocol version id"))
+
             }
         };
+
+        let storage_batch = self
+            .pool
+            .connection()
+            .await
+            .unwrap()
+            .blocks_dal()
+            .get_storage_l1_batch(l1_batch_number)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let eip_4844_blobs: Eip4844Blobs = storage_batch
+            .pubdata_input
+            .expect(&format!(
+                "expected pubdata, but it is not available for batch {l1_batch_number:?}"
+            ))
+            .into();
 
         let proof_gen_data = ProofGenerationData {
             l1_batch_number,
             data: blob,
             fri_protocol_version_id,
             l1_verifier_config,
+            eip_4844_blobs,
         };
-
-        Ok(Json(ProofGenerationDataResponse::Success(proof_gen_data)))
+        Ok(Json(ProofGenerationDataResponse::Success(Some(
+            proof_gen_data,
+        ))))
     }
 
     pub(crate) async fn submit_proof(
@@ -140,7 +189,76 @@ impl RequestProcessor {
                     .await
                     .map_err(RequestProcessorError::ObjectStore)?;
 
-                let mut storage = self.pool.access_storage().await.unwrap();
+                let system_logs_hash_from_prover =
+                    H256::from_slice(&proof.aggregation_result_coords[0]);
+                let state_diff_hash_from_prover =
+                    H256::from_slice(&proof.aggregation_result_coords[1]);
+                let bootloader_heap_initial_content_from_prover =
+                    H256::from_slice(&proof.aggregation_result_coords[2]);
+                let events_queue_state_from_prover =
+                    H256::from_slice(&proof.aggregation_result_coords[3]);
+
+                let mut storage = self.pool.connection().await.unwrap();
+
+                let l1_batch = storage
+                    .blocks_dal()
+                    .get_l1_batch_metadata(l1_batch_number)
+                    .await
+                    .unwrap()
+                    .expect("Proved block without metadata");
+
+                let is_pre_boojum = l1_batch
+                    .header
+                    .protocol_version
+                    .map(|v| v.is_pre_boojum())
+                    .unwrap_or(true);
+                if !is_pre_boojum {
+                    let events_queue_state = l1_batch
+                        .metadata
+                        .events_queue_commitment
+                        .expect("No events_queue_commitment");
+                    let bootloader_heap_initial_content = l1_batch
+                        .metadata
+                        .bootloader_initial_content_commitment
+                        .expect("No bootloader_initial_content_commitment");
+
+                    if events_queue_state != events_queue_state_from_prover
+                        || bootloader_heap_initial_content
+                            != bootloader_heap_initial_content_from_prover
+                    {
+                        let server_values = format!("events_queue_state = {events_queue_state}, bootloader_heap_initial_content = {bootloader_heap_initial_content}");
+                        let prover_values = format!("events_queue_state = {events_queue_state_from_prover}, bootloader_heap_initial_content = {bootloader_heap_initial_content_from_prover}");
+                        panic!(
+                            "Auxilary output doesn't match, server values: {} prover values: {}",
+                            server_values, prover_values
+                        );
+                    }
+                }
+
+                let system_logs = serialize_commitments(&l1_batch.header.system_logs);
+                let system_logs_hash = H256(keccak256(&system_logs));
+
+                if !is_pre_boojum {
+                    let state_diff_hash = l1_batch
+                        .header
+                        .system_logs
+                        .into_iter()
+                        .find(|elem| elem.0.key == u256_to_h256(2.into()))
+                        .expect("No state diff hash key")
+                        .0
+                        .value;
+
+                    if state_diff_hash != state_diff_hash_from_prover
+                        || system_logs_hash != system_logs_hash_from_prover
+                    {
+                        let server_values = format!("system_logs_hash = {system_logs_hash}, state_diff_hash = {state_diff_hash}");
+                        let prover_values = format!("system_logs_hash = {system_logs_hash_from_prover}, state_diff_hash = {state_diff_hash_from_prover}");
+                        panic!(
+                            "Auxilary output doesn't match, server values: {} prover values: {}",
+                            server_values, prover_values
+                        );
+                    }
+                }
                 storage
                     .proof_generation_dal()
                     .save_proof_artifacts_metadata(l1_batch_number, &blob_url)
@@ -149,7 +267,7 @@ impl RequestProcessor {
             }
             SubmitProofRequest::SkippedProofGeneration => {
                 self.pool
-                    .access_storage()
+                    .connection()
                     .await
                     .unwrap()
                     .proof_generation_dal()
